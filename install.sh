@@ -131,6 +131,7 @@ Description=singbox-easy service
 Documentation=https://github.com/${PROJECT_REPO}
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
