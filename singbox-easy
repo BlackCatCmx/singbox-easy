@@ -1,0 +1,598 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+readonly PROJECT_REPO="BlackCatCmx/singbox-easy"
+readonly INSTALL_DIR="/etc/singbox-easy"
+readonly CORE_BIN="${INSTALL_DIR}/bin/sing-box"
+readonly CONFIG_FILE="${INSTALL_DIR}/config.json"
+readonly CONF_DIR="${INSTALL_DIR}/conf.d"
+readonly STATE_DIR="${INSTALL_DIR}/state"
+readonly TLS_DIR="${INSTALL_DIR}/tls"
+readonly SERVICE_NAME="singbox-easy.service"
+readonly SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
+readonly MANAGER_BIN="/usr/local/bin/sbe"
+
+log() {
+    printf '[singbox-easy] %s\n' "$*"
+}
+
+die() {
+    printf '[singbox-easy] ERROR: %s\n' "$*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<'EOF'
+singbox-easy - minimal sing-box server manager
+
+Usage:
+  sbe add <reality|hysteria2|shadowsocks> [NAME] [options]
+  sbe list
+  sbe show <NAME>
+  sbe set <NAME> <port|address|sni> <VALUE>
+  sbe remove <NAME>
+  sbe check
+  sbe status
+  sbe start|stop|restart
+  sbe logs
+  sbe update [--no-restart]
+  sbe uninstall
+  sbe version
+
+Add options:
+  --port PORT        Use a specific listen port.
+  --address ADDRESS  Public IPv4, IPv6, or domain used in the share URL.
+  --sni DOMAIN       Reality handshake server (default: www.cloudflare.com).
+
+Examples:
+  sbe add reality home
+  sbe add hysteria2 mobile --port 443
+  sbe add shadowsocks backup --address proxy.example.com
+  sbe set home sni www.microsoft.com
+  sbe set mobile port 8443
+EOF
+}
+
+require_root() {
+    [[ ${EUID} -eq 0 ]] || die "this command must run as root"
+}
+
+require_installation() {
+    [[ -x $CORE_BIN && -f $CONFIG_FILE && -d $CONF_DIR && -d $STATE_DIR ]] || {
+        die "singbox-easy is not installed correctly"
+    }
+}
+
+normalize_protocol() {
+    case "${1,,}" in
+    reality | vless-reality | vless_reality) printf 'reality\n' ;;
+    hysteria2 | hysteria | hy2) printf 'hysteria2\n' ;;
+    shadowsocks | shadow | ss | ss2022) printf 'shadowsocks\n' ;;
+    *) die "unsupported protocol: $1" ;;
+    esac
+}
+
+validate_name() {
+    [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]] || {
+        die "profile name must match [A-Za-z0-9][A-Za-z0-9_-]{0,31}"
+    }
+}
+
+validate_port() {
+    [[ $1 =~ ^[0-9]+$ ]] && ((1 <= 10#$1 && 10#$1 <= 65535)) || {
+        die "port must be between 1 and 65535"
+    }
+}
+
+port_in_use() {
+    local port=$1
+    if command -v ss >/dev/null; then
+        ss -H -lntu | awk '{print $5}' | grep -Eq "(^|:)$port$" && return 0
+    fi
+    grep -Rqs '"listen_port"[[:space:]]*:[[:space:]]*'"$port"'\([,[:space:]]\|$\)' "$CONF_DIR" && return 0
+    return 1
+}
+
+random_port() {
+    local port
+    for _ in {1..128}; do
+        port=$(shuf -i 10000-60000 -n 1)
+        if ! port_in_use "$port"; then
+            printf '%s\n' "$port"
+            return
+        fi
+    done
+    die "could not find an available port"
+}
+
+validate_address() {
+    [[ $1 != *['/?#@']* && -n $1 ]] || die "invalid public address: $1"
+}
+
+validate_sni() {
+    [[ $1 =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ && $1 == *.* ]] || {
+        die "invalid SNI domain: $1"
+    }
+}
+
+public_address() {
+    local response address
+    response=$(curl -4 -fsSL --max-time 10 https://one.one.one.one/cdn-cgi/trace 2>/dev/null || true)
+    address=$(awk -F= '$1 == "ip" {print $2; exit}' <<<"$response")
+    if [[ -z $address ]]; then
+        response=$(curl -6 -fsSL --max-time 10 https://one.one.one.one/cdn-cgi/trace 2>/dev/null || true)
+        address=$(awk -F= '$1 == "ip" {print $2; exit}' <<<"$response")
+    fi
+    [[ -n $address ]] || die "could not detect the public address; use --address"
+    printf '%s\n' "$address"
+}
+
+url_host() {
+    if [[ $1 == *:* && $1 != \[*\] ]]; then
+        printf '[%s]' "$1"
+    else
+        printf '%s' "$1"
+    fi
+}
+
+url_encode() {
+    jq -rn --arg value "$1" '$value | @uri'
+}
+
+ensure_tls_certificate() {
+    if [[ -s ${TLS_DIR}/server.crt && -s ${TLS_DIR}/server.key ]]; then
+        return
+    fi
+
+    log "generating a self-signed TLS certificate"
+    openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 3650 \
+        -subj '/CN=singbox-easy' \
+        -keyout "${TLS_DIR}/server.key" \
+        -out "${TLS_DIR}/server.crt" >/dev/null 2>&1
+    chmod 0600 "${TLS_DIR}/server.key" "${TLS_DIR}/server.crt"
+}
+
+generate_reality_keys() {
+    local output private_key public_key
+    output=$($CORE_BIN generate reality-keypair)
+    private_key=$(awk -F: 'tolower($1) ~ /private/ {sub(/^[[:space:]]+/, "", $2); print $2; exit}' <<<"$output")
+    public_key=$(awk -F: 'tolower($1) ~ /public/ {sub(/^[[:space:]]+/, "", $2); print $2; exit}' <<<"$output")
+    [[ -n $private_key && -n $public_key ]] || die "could not parse the Reality key pair"
+    printf '%s\t%s\n' "$private_key" "$public_key"
+}
+
+write_reality_profile() {
+    local name=$1 port=$2 address=$3 sni=$4 conf_file=$5 state_file=$6
+    local uuid key_pair private_key public_key details
+    uuid=$($CORE_BIN generate uuid)
+    key_pair=$(generate_reality_keys)
+    IFS=$'\t' read -r private_key public_key <<<"$key_pair"
+
+    jq -n \
+        --arg tag "$name" \
+        --arg uuid "$uuid" \
+        --arg sni "$sni" \
+        --arg private_key "$private_key" \
+        --argjson port "$port" \
+        '{
+          inbounds: [{
+            type: "vless",
+            tag: $tag,
+            listen: "::",
+            listen_port: $port,
+            users: [{uuid: $uuid, flow: "xtls-rprx-vision"}],
+            tls: {
+              enabled: true,
+              server_name: $sni,
+              reality: {
+                enabled: true,
+                handshake: {server: $sni, server_port: 443},
+                private_key: $private_key,
+                short_id: [""]
+              }
+            }
+          }]
+        }' >"$conf_file"
+
+    details=$(jq -nc --arg uuid "$uuid" --arg public_key "$public_key" --arg sni "$sni" \
+        '{uuid: $uuid, public_key: $public_key, sni: $sni}')
+    write_state "$state_file" "$name" reality "$address" "$port" "$details"
+}
+
+write_hysteria2_profile() {
+    local name=$1 port=$2 address=$3 conf_file=$4 state_file=$5
+    local password details
+    ensure_tls_certificate
+    password=$($CORE_BIN generate rand 32 --base64)
+
+    jq -n \
+        --arg tag "$name" \
+        --arg password "$password" \
+        --arg certificate "${TLS_DIR}/server.crt" \
+        --arg key "${TLS_DIR}/server.key" \
+        --argjson port "$port" \
+        '{
+          inbounds: [{
+            type: "hysteria2",
+            tag: $tag,
+            listen: "::",
+            listen_port: $port,
+            users: [{password: $password}],
+            tls: {
+              enabled: true,
+              alpn: ["h3"],
+              certificate_path: $certificate,
+              key_path: $key
+            }
+          }]
+        }' >"$conf_file"
+
+    details=$(jq -nc --arg password "$password" '{password: $password}')
+    write_state "$state_file" "$name" hysteria2 "$address" "$port" "$details"
+}
+
+write_shadowsocks_profile() {
+    local name=$1 port=$2 address=$3 conf_file=$4 state_file=$5
+    local method password details
+    method='2022-blake3-aes-256-gcm'
+    password=$($CORE_BIN generate rand 32 --base64)
+
+    jq -n \
+        --arg tag "$name" \
+        --arg method "$method" \
+        --arg password "$password" \
+        --argjson port "$port" \
+        '{
+          inbounds: [{
+            type: "shadowsocks",
+            tag: $tag,
+            listen: "::",
+            listen_port: $port,
+            method: $method,
+            password: $password
+          }]
+        }' >"$conf_file"
+
+    details=$(jq -nc --arg method "$method" --arg password "$password" \
+        '{method: $method, password: $password}')
+    write_state "$state_file" "$name" shadowsocks "$address" "$port" "$details"
+}
+
+write_state() {
+    local state_file=$1 name=$2 protocol=$3 address=$4 port=$5 details=$6
+    jq -n \
+        --arg name "$name" \
+        --arg protocol "$protocol" \
+        --arg address "$address" \
+        --argjson port "$port" \
+        --argjson details "$details" \
+        '{name: $name, protocol: $protocol, address: $address, port: $port} + $details' \
+        >"$state_file"
+    refresh_state_url "$state_file"
+}
+
+refresh_state_url() {
+    local state_file=$1 protocol name address port host url
+    protocol=$(jq -er '.protocol' "$state_file")
+    name=$(jq -er '.name' "$state_file")
+    address=$(jq -er '.address' "$state_file")
+    port=$(jq -er '.port' "$state_file")
+    host=$(url_host "$address")
+
+    case "$protocol" in
+    reality)
+        local uuid public_key sni encoded_pbk
+        uuid=$(jq -er '.uuid' "$state_file")
+        public_key=$(jq -er '.public_key' "$state_file")
+        sni=$(jq -er '.sni' "$state_file")
+        encoded_pbk=$(url_encode "$public_key")
+        url="vless://${uuid}@${host}:${port}?encryption=none&security=reality&flow=xtls-rprx-vision&type=tcp&sni=${sni}&pbk=${encoded_pbk}&fp=chrome#${name}"
+        ;;
+    hysteria2)
+        local password encoded_password
+        password=$(jq -er '.password' "$state_file")
+        encoded_password=$(url_encode "$password")
+        url="hysteria2://${encoded_password}@${host}:${port}?insecure=1#${name}"
+        ;;
+    shadowsocks)
+        local method password userinfo
+        method=$(jq -er '.method' "$state_file")
+        password=$(jq -er '.password' "$state_file")
+        userinfo=$(printf '%s:%s' "$method" "$password" | base64 -w 0)
+        url="ss://${userinfo}@${host}:${port}#${name}"
+        ;;
+    esac
+
+    jq --arg url "$url" '.url = $url' "$state_file" >"${state_file}.url"
+    mv "${state_file}.url" "$state_file"
+}
+
+check_config() {
+    "$CORE_BIN" check -c "$CONFIG_FILE" -C "$CONF_DIR"
+}
+
+add_profile() {
+    (($# >= 1)) || die "usage: sbe add <protocol> [NAME] [options]"
+    local protocol name='' port='' address='' sni='www.cloudflare.com'
+    local conf_file state_file tmp_conf tmp_state
+    protocol=$(normalize_protocol "$1")
+    shift
+
+    if (($#)) && [[ $1 != --* ]]; then
+        name=$1
+        shift
+    fi
+
+    while (($#)); do
+        case "$1" in
+        --port)
+            (($# >= 2)) || die "--port requires a value"
+            port=$2
+            shift 2
+            ;;
+        --address)
+            (($# >= 2)) || die "--address requires a value"
+            address=$2
+            shift 2
+            ;;
+        --sni)
+            (($# >= 2)) || die "--sni requires a value"
+            sni=$2
+            shift 2
+            ;;
+        *) die "unknown add option: $1" ;;
+        esac
+    done
+
+    if [[ -n $port ]]; then
+        validate_port "$port"
+        port_in_use "$port" && die "port is already in use: $port"
+    else
+        port=$(random_port)
+    fi
+
+    [[ -n $name ]] || name="${protocol}-${port}"
+    validate_name "$name"
+    [[ -n $address ]] || address=$(public_address)
+    validate_address "$address"
+    validate_sni "$sni"
+
+    conf_file="${CONF_DIR}/${name}.json"
+    state_file="${STATE_DIR}/${name}.json"
+    [[ ! -e $conf_file && ! -e $state_file ]] || die "profile already exists: $name"
+
+    tmp_conf="${conf_file}.new"
+    tmp_state="${state_file}.new"
+    trap 'rm -f "${tmp_conf:-}" "${tmp_state:-}"' EXIT
+
+    case "$protocol" in
+    reality) write_reality_profile "$name" "$port" "$address" "$sni" "$tmp_conf" "$tmp_state" ;;
+    hysteria2) write_hysteria2_profile "$name" "$port" "$address" "$tmp_conf" "$tmp_state" ;;
+    shadowsocks) write_shadowsocks_profile "$name" "$port" "$address" "$tmp_conf" "$tmp_state" ;;
+    esac
+
+    chmod 0600 "$tmp_conf" "$tmp_state"
+    mv "$tmp_conf" "$conf_file"
+    if ! check_config >/dev/null; then
+        rm -f "$conf_file"
+        check_config || true
+        die "generated configuration failed validation"
+    fi
+    mv "$tmp_state" "$state_file"
+    systemctl restart "$SERVICE_NAME"
+    systemctl is-active --quiet "$SERVICE_NAME" || die "service failed to start"
+    trap - EXIT
+
+    log "profile created: $name"
+    show_profile "$name"
+}
+
+list_profiles() {
+    local found=0 file
+    printf '%-32s %-14s %-8s %s\n' NAME PROTOCOL PORT ADDRESS
+    for file in "$STATE_DIR"/*.json; do
+        [[ -e $file ]] || continue
+        found=1
+        jq -r '[.name, .protocol, (.port | tostring), .address] | @tsv' "$file" |
+            awk -F '\t' '{printf "%-32s %-14s %-8s %s\n", $1, $2, $3, $4}'
+    done
+    ((found)) || printf '(no profiles)\n'
+}
+
+show_profile() {
+    (($# == 1)) || die "usage: sbe show <NAME>"
+    validate_name "$1"
+    local state_file="${STATE_DIR}/$1.json"
+    [[ -f $state_file ]] || die "profile not found: $1"
+    jq -r '"Name:     \(.name)\nProtocol: \(.protocol)\nAddress:  \(.address)\nPort:     \(.port)\nURL:      \(.url)"' "$state_file"
+}
+
+set_profile() {
+    (($# == 3)) || die "usage: sbe set <NAME> <port|address|sni> <VALUE>"
+    local name=$1 field=${2,,} value=$3
+    local conf_file state_file tmp_conf tmp_state protocol old_port restart=0
+    validate_name "$name"
+    conf_file="${CONF_DIR}/${name}.json"
+    state_file="${STATE_DIR}/${name}.json"
+    [[ -f $conf_file && -f $state_file ]] || die "profile not found: $name"
+    protocol=$(jq -er '.protocol' "$state_file")
+    old_port=$(jq -er '.port' "$state_file")
+    tmp_conf="${conf_file}.new"
+    tmp_state="${state_file}.new"
+    trap 'rm -f "${tmp_conf:-}" "${tmp_state:-}" "${tmp_state:-}.url"' EXIT
+
+    case "$field" in
+    port)
+        validate_port "$value"
+        if [[ $value != "$old_port" ]]; then
+            port_in_use "$value" && die "port is already in use: $value"
+        fi
+        jq --argjson port "$value" '.inbounds[0].listen_port = $port' "$conf_file" >"$tmp_conf"
+        jq --argjson port "$value" '.port = $port' "$state_file" >"$tmp_state"
+        restart=1
+        ;;
+    address)
+        validate_address "$value"
+        cp "$conf_file" "$tmp_conf"
+        jq --arg address "$value" '.address = $address' "$state_file" >"$tmp_state"
+        ;;
+    sni)
+        [[ $protocol == reality ]] || die "SNI can only be changed for Reality profiles"
+        validate_sni "$value"
+        jq --arg sni "$value" \
+            '.inbounds[0].tls.server_name = $sni | .inbounds[0].tls.reality.handshake.server = $sni' \
+            "$conf_file" >"$tmp_conf"
+        jq --arg sni "$value" '.sni = $sni' "$state_file" >"$tmp_state"
+        restart=1
+        ;;
+    *) die "unsupported setting: $field" ;;
+    esac
+
+    "$CORE_BIN" check -c "$tmp_conf" >/dev/null
+    refresh_state_url "$tmp_state"
+    chmod 0600 "$tmp_conf" "$tmp_state"
+    mv "$tmp_conf" "$conf_file"
+    mv "$tmp_state" "$state_file"
+    if ((restart)); then
+        systemctl restart "$SERVICE_NAME"
+        systemctl is-active --quiet "$SERVICE_NAME" || die "service failed to start"
+    fi
+    trap - EXIT
+
+    log "profile updated: ${name} (${field})"
+    show_profile "$name"
+}
+
+remove_profile() {
+    (($# == 1)) || die "usage: sbe remove <NAME>"
+    validate_name "$1"
+    local conf_file="${CONF_DIR}/$1.json" state_file="${STATE_DIR}/$1.json"
+    [[ -f $conf_file && -f $state_file ]] || die "profile not found: $1"
+
+    rm -f "$conf_file" "$state_file"
+    check_config >/dev/null
+    systemctl restart "$SERVICE_NAME"
+    log "profile removed: $1"
+}
+
+detect_arch() {
+    case "$(uname -m)" in
+    x86_64 | amd64) printf 'amd64\n' ;;
+    aarch64 | arm64) printf 'arm64\n' ;;
+    *) die "only AMD64 and ARM64 are supported" ;;
+    esac
+}
+
+update_core() {
+    local no_restart=0
+    if (($#)); then
+        [[ $1 == --no-restart && $# == 1 ]] || die "usage: sbe update [--no-restart]"
+        no_restart=1
+    fi
+
+    local arch release_json version asset_name asset_url expected_digest
+    local tmp_dir archive extracted extracted_dir actual_digest
+    arch=$(detect_arch)
+    tmp_dir=$(mktemp -d)
+    trap 'rm -rf "${tmp_dir:-}"' EXIT
+
+    release_json="${tmp_dir}/release.json"
+    curl -fL --retry 3 --retry-delay 1 \
+        https://api.github.com/repos/SagerNet/sing-box/releases/latest \
+        -o "$release_json"
+    version=$(jq -er '.tag_name' "$release_json")
+    asset_name="sing-box-${version#v}-linux-${arch}.tar.gz"
+    asset_url=$(jq -er --arg name "$asset_name" '.assets[] | select(.name == $name) | .browser_download_url' "$release_json")
+    expected_digest=$(jq -er --arg name "$asset_name" '.assets[] | select(.name == $name) | .digest | select(startswith("sha256:")) | sub("^sha256:"; "")' "$release_json")
+
+    log "downloading sing-box ${version} for ${arch}"
+    archive="${tmp_dir}/${asset_name}"
+    curl -fL --retry 3 --retry-delay 1 "$asset_url" -o "$archive"
+    actual_digest=$(sha256sum "$archive" | awk '{print $1}')
+    [[ $actual_digest == "$expected_digest" ]] || die "sing-box archive checksum mismatch"
+
+    tar -tzf "$archive" | grep -Eq '^sing-box-[^/]+/sing-box$' || die "sing-box archive layout is invalid"
+    tar -xzf "$archive" -C "$tmp_dir"
+    extracted_dir="${tmp_dir}/sing-box-${version#v}-linux-${arch}"
+    extracted="${extracted_dir}/sing-box"
+    [[ -f $extracted ]] || die "sing-box binary is missing from the archive"
+    install -m 0755 "$extracted" "${CORE_BIN}.new"
+    mv "${CORE_BIN}.new" "$CORE_BIN"
+    if [[ -f ${extracted_dir}/libcronet.so ]]; then
+        install -m 0644 "${extracted_dir}/libcronet.so" "${INSTALL_DIR}/bin/libcronet.so.new"
+        mv "${INSTALL_DIR}/bin/libcronet.so.new" "${INSTALL_DIR}/bin/libcronet.so"
+    else
+        rm -f "${INSTALL_DIR}/bin/libcronet.so"
+    fi
+
+    if [[ -f $CONFIG_FILE ]]; then
+        check_config >/dev/null
+    fi
+    if ((no_restart == 0)) && systemctl list-unit-files "$SERVICE_NAME" >/dev/null 2>&1; then
+        systemctl restart "$SERVICE_NAME"
+    fi
+    trap - EXIT
+    rm -rf "$tmp_dir"
+    log "sing-box updated to ${version}"
+}
+
+uninstall_all() {
+    systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
+    rm -f "$SERVICE_FILE"
+    systemctl daemon-reload
+    systemctl reset-failed "$SERVICE_NAME" >/dev/null 2>&1 || true
+    rm -rf "$INSTALL_DIR"
+    rm -f "$MANAGER_BIN"
+    printf '[singbox-easy] uninstalled; all configurations were removed\n'
+}
+
+show_status() {
+    systemctl --no-pager --full status "$SERVICE_NAME" || true
+}
+
+show_version() {
+    "$CORE_BIN" version | head -n 1
+    printf 'singbox-easy manager: 0.1.0\n'
+}
+
+main() {
+    (($#)) || {
+        usage
+        exit 0
+    }
+
+    case "$1" in
+    -h | --help | help)
+        usage
+        ;;
+    uninstall)
+        require_root
+        uninstall_all
+        ;;
+    update)
+        require_root
+        shift
+        update_core "$@"
+        ;;
+    *)
+        require_root
+        require_installation
+        case "$1" in
+        add) shift; add_profile "$@" ;;
+        list | ls) list_profiles ;;
+        show) shift; show_profile "$@" ;;
+        set) shift; set_profile "$@" ;;
+        remove | rm) shift; remove_profile "$@" ;;
+        check) check_config ;;
+        status) show_status ;;
+        start | stop | restart) systemctl "$1" "$SERVICE_NAME" ;;
+        logs) journalctl -u "$SERVICE_NAME" -f ;;
+        version | -v | --version) show_version ;;
+        *) die "unknown command: $1" ;;
+        esac
+        ;;
+    esac
+}
+
+main "$@"
