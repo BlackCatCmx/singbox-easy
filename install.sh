@@ -149,7 +149,6 @@ WantedBy=multi-user.target
 EOF
 
     systemctl daemon-reload
-    systemctl enable singbox-easy.service >/dev/null
 }
 
 main() {
@@ -167,7 +166,7 @@ main() {
         log "creating the default VLESS-REALITY profile"
         "$MANAGER_BIN" add reality default
     else
-        systemctl start singbox-easy.service
+        log "no profile was created; the service remains disabled and stopped"
     fi
 
     log "installation completed"

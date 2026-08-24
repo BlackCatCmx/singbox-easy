@@ -29,6 +29,8 @@ curl -fsSL https://raw.githubusercontent.com/BlackCatCmx/singbox-easy/main/insta
 curl -fsSL https://raw.githubusercontent.com/BlackCatCmx/singbox-easy/main/install.sh | sudo bash -s -- --no-profile
 ```
 
+此模式只安装程序和 systemd 服务文件，服务保持禁用和停止；第一次添加配置后自动启用并启动。
+
 ## 使用
 
 ```text

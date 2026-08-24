@@ -312,6 +312,10 @@ check_config() {
     "$CORE_BIN" check -c "$CONFIG_FILE" -C "$CONF_DIR"
 }
 
+has_profiles() {
+    compgen -G "${CONF_DIR}/*.json" >/dev/null
+}
+
 add_profile() {
     (($# >= 1)) || die "usage: sbe add <protocol> [NAME] [options]"
     local protocol name='' port='' address='' sni='www.cloudflare.com'
@@ -380,6 +384,7 @@ add_profile() {
         die "generated configuration failed validation"
     fi
     mv "$tmp_state" "$state_file"
+    systemctl enable "$SERVICE_NAME" >/dev/null
     systemctl restart "$SERVICE_NAME"
     systemctl is-active --quiet "$SERVICE_NAME" || die "service failed to start"
     trap - EXIT
@@ -472,7 +477,12 @@ remove_profile() {
 
     rm -f "$conf_file" "$state_file"
     check_config >/dev/null
-    systemctl restart "$SERVICE_NAME"
+    if has_profiles; then
+        systemctl restart "$SERVICE_NAME"
+    else
+        systemctl disable --now "$SERVICE_NAME" >/dev/null
+        log "no profiles remain; the service was disabled and stopped"
+    fi
     log "profile removed: $1"
 }
 
@@ -485,10 +495,13 @@ detect_arch() {
 }
 
 update_core() {
-    local no_restart=0
+    local no_restart=0 was_active=0
     if (($#)); then
         [[ $1 == --no-restart && $# == 1 ]] || die "usage: sbe update [--no-restart]"
         no_restart=1
+    fi
+    if ((no_restart == 0)) && systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+        was_active=1
     fi
 
     local arch release_json version asset_name asset_url expected_digest
@@ -529,7 +542,7 @@ update_core() {
     if [[ -f $CONFIG_FILE ]]; then
         check_config >/dev/null
     fi
-    if ((no_restart == 0)) && systemctl list-unit-files "$SERVICE_NAME" >/dev/null 2>&1; then
+    if ((was_active)); then
         systemctl restart "$SERVICE_NAME"
     fi
     trap - EXIT
@@ -586,7 +599,11 @@ main() {
         remove | rm) shift; remove_profile "$@" ;;
         check) check_config ;;
         status) show_status ;;
-        start | stop | restart) systemctl "$1" "$SERVICE_NAME" ;;
+        start | restart)
+            has_profiles || die "no profiles exist; add a profile first"
+            systemctl "$1" "$SERVICE_NAME"
+            ;;
+        stop) systemctl stop "$SERVICE_NAME" ;;
         logs) journalctl -u "$SERVICE_NAME" -f ;;
         version | -v | --version) show_version ;;
         *) die "unknown command: $1" ;;
