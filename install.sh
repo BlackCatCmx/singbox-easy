@@ -6,14 +6,20 @@ readonly PROJECT_REPO="BlackCatCmx/singbox-easy"
 readonly PROJECT_REF_DEFAULT="main"
 readonly INSTALL_DIR="/etc/singbox-easy"
 readonly CORE_BIN="${INSTALL_DIR}/bin/sing-box"
-readonly MANAGER_BIN="/usr/local/bin/sbe"
+readonly MANAGER_BIN="/usr/local/bin/sb"
 readonly SERVICE_FILE="/etc/systemd/system/singbox-easy.service"
 
 project_ref="${SINGBOX_EASY_REF:-$PROJECT_REF_DEFAULT}"
 create_default_profile=1
 profile_protocol='reality'
+profile_protocols_raw=''
+profile_protocol_list=()
+protocol_argument=''
 profile_name='default'
 profile_port=''
+reality_port=''
+hy2_port=''
+shadowsocks_port=''
 profile_address=''
 profile_sni=''
 hy2_port_range=''
@@ -34,8 +40,12 @@ Usage: install.sh [options]
 
 Options:
   --protocol VALUE         reality, hysteria2, or shadowsocks (default: reality)
+  --protocols LIST         Multiple protocols, e.g. reality,hysteria2
   --name NAME              Initial profile name (default: default)
   --port PORT              Initial profile listen port (default: random free port)
+  --reality-port PORT      Reality port for multi-protocol installation
+  --hy2-port PORT          Hysteria2 port for multi-protocol installation
+  --ss-port PORT           Shadowsocks port for multi-protocol installation
   --address ADDRESS        Public address written to the share URL
   --sni DOMAIN             Reality handshake domain (default: www.cloudflare.com)
   --hy2-port-range RANGE   Hysteria2 UDP hopping range, e.g. 20000:30000;
@@ -56,7 +66,17 @@ parse_args() {
             ;;
         --protocol)
             (($# >= 2)) || die "--protocol requires a value"
+            [[ -z $protocol_argument ]] || die "use only one of --protocol and --protocols"
             profile_protocol=$2
+            protocol_argument='single'
+            profile_option_set=1
+            shift 2
+            ;;
+        --protocols)
+            (($# >= 2)) || die "--protocols requires a value"
+            [[ -z $protocol_argument ]] || die "use only one of --protocol and --protocols"
+            profile_protocols_raw=$2
+            protocol_argument='multiple'
             profile_option_set=1
             shift 2
             ;;
@@ -69,6 +89,24 @@ parse_args() {
         --port)
             (($# >= 2)) || die "--port requires a value"
             profile_port=$2
+            profile_option_set=1
+            shift 2
+            ;;
+        --reality-port)
+            (($# >= 2)) || die "--reality-port requires a value"
+            reality_port=$2
+            profile_option_set=1
+            shift 2
+            ;;
+        --hy2-port)
+            (($# >= 2)) || die "--hy2-port requires a value"
+            hy2_port=$2
+            profile_option_set=1
+            shift 2
+            ;;
+        --ss-port | --shadowsocks-port)
+            (($# >= 2)) || die "$1 requires a value"
+            shadowsocks_port=$2
             profile_option_set=1
             shift 2
             ;;
@@ -109,34 +147,71 @@ parse_args() {
     fi
 }
 
+normalize_installer_protocol() {
+    case "${1,,}" in
+    reality | vless | vless-reality | vless_reality) printf 'reality\n' ;;
+    hysteria2 | hysteria | hy2) printf 'hysteria2\n' ;;
+    shadowsocks | shadow | ss | ss2022) printf 'shadowsocks\n' ;;
+    *) die "unsupported protocol: $1" ;;
+    esac
+}
+
+normalize_installer_port() {
+    [[ $1 =~ ^[0-9]+$ ]] && ((1 <= 10#$1 && 10#$1 <= 65535)) || {
+        die "port must be between 1 and 65535: $1"
+    }
+    printf '%s\n' "$((10#$1))"
+}
+
 validate_profile_options() {
     ((create_default_profile)) || return
 
-    case "${profile_protocol,,}" in
-    reality | vless | vless-reality | vless_reality) profile_protocol='reality' ;;
-    hysteria2 | hysteria | hy2) profile_protocol='hysteria2' ;;
-    shadowsocks | shadow | ss | ss2022) profile_protocol='shadowsocks' ;;
-    *) die "unsupported protocol: $profile_protocol" ;;
-    esac
+    local raw_protocols protocol normalized seen=' '
+    local -a requested_protocols
+    if [[ -n $profile_protocols_raw ]]; then
+        raw_protocols=${profile_protocols_raw//+/,}
+        if [[ ${raw_protocols,,} == both ]]; then
+            raw_protocols='reality,hysteria2'
+        fi
+        IFS=',' read -r -a requested_protocols <<<"$raw_protocols"
+    else
+        requested_protocols=("$profile_protocol")
+    fi
+    ((${#requested_protocols[@]})) || die "--protocols cannot be empty"
+    for protocol in "${requested_protocols[@]}"; do
+        [[ -n $protocol ]] || die "--protocols contains an empty value"
+        normalized=$(normalize_installer_protocol "$protocol")
+        [[ $seen != *" $normalized "* ]] || die "duplicate protocol: $normalized"
+        profile_protocol_list+=("$normalized")
+        seen+="$normalized "
+    done
 
     [[ $profile_name =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]] || die "invalid profile name: $profile_name"
-    if [[ -n $profile_port ]]; then
-        [[ $profile_port =~ ^[0-9]+$ ]] && ((1 <= 10#$profile_port && 10#$profile_port <= 65535)) || {
-            die "port must be between 1 and 65535"
-        }
-        profile_port=$((10#$profile_port))
+    if ((${#profile_protocol_list[@]} > 1)); then
+        [[ -z $profile_port ]] || die "use protocol-specific ports with --protocols"
+        ((${#profile_name} <= 26)) || die "multi-protocol name must not exceed 26 characters"
     fi
     [[ -z $profile_address || $profile_address != *['/?#@']* ]] || die "invalid public address: $profile_address"
 
+    [[ -z $profile_port ]] || profile_port=$(normalize_installer_port "$profile_port")
+    [[ -z $reality_port ]] || reality_port=$(normalize_installer_port "$reality_port")
+    [[ -z $hy2_port ]] || hy2_port=$(normalize_installer_port "$hy2_port")
+    [[ -z $shadowsocks_port ]] || shadowsocks_port=$(normalize_installer_port "$shadowsocks_port")
+
+    local selected=" ${profile_protocol_list[*]} "
+    [[ -z $reality_port || $selected == *' reality '* ]] || die "--reality-port requires Reality"
+    [[ -z $hy2_port || $selected == *' hysteria2 '* ]] || die "--hy2-port requires Hysteria2"
+    [[ -z $shadowsocks_port || $selected == *' shadowsocks '* ]] || die "--ss-port requires Shadowsocks"
+
     if [[ -n $profile_sni ]]; then
-        [[ $profile_protocol == reality ]] || die "--sni is only supported by Reality"
+        [[ $selected == *' reality '* ]] || die "--sni requires Reality"
         [[ $profile_sni =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ && $profile_sni == *.* ]] || {
             die "invalid SNI domain: $profile_sni"
         }
     fi
 
     if [[ -n $hy2_port_range ]]; then
-        [[ $profile_protocol == hysteria2 ]] || die "--hy2-port-range requires Hysteria2"
+        [[ $selected == *' hysteria2 '* ]] || die "--hy2-port-range requires Hysteria2"
         hy2_port_range=${hy2_port_range/-/:}
         [[ $hy2_port_range =~ ^([0-9]+):([0-9]+)$ ]] || die "port range must use START:END"
         local range_start=${BASH_REMATCH[1]} range_end=${BASH_REMATCH[2]}
@@ -145,12 +220,39 @@ validate_profile_options() {
         }
         range_start=$((10#$range_start))
         range_end=$((10#$range_end))
-        [[ -z $profile_port || $profile_port == "$range_start" ]] || {
-            die "--port must equal the Hysteria2 range start: $range_start"
+        [[ -z $hy2_port || $hy2_port == "$range_start" ]] || {
+            die "--hy2-port must equal the Hysteria2 range start: $range_start"
         }
-        profile_port=$range_start
+        if ((${#profile_protocol_list[@]} == 1)); then
+            [[ -z $profile_port || $profile_port == "$range_start" ]] || {
+                die "--port must equal the Hysteria2 range start: $range_start"
+            }
+        fi
+        hy2_port=$range_start
         hy2_port_range="${range_start}:${range_end}"
     fi
+
+    local effective_port specific_port
+    local -A used_ports=()
+    for protocol in "${profile_protocol_list[@]}"; do
+        specific_port=''
+        case "$protocol" in
+        reality) specific_port=$reality_port ;;
+        hysteria2) specific_port=$hy2_port ;;
+        shadowsocks) specific_port=$shadowsocks_port ;;
+        esac
+        effective_port=$specific_port
+        if ((${#profile_protocol_list[@]} == 1)) && [[ -n $profile_port ]]; then
+            [[ -z $specific_port || $specific_port == "$profile_port" ]] || {
+                die "--port conflicts with the protocol-specific port"
+            }
+            effective_port=$profile_port
+        fi
+        if [[ -n $effective_port ]]; then
+            [[ -z ${used_ports[$effective_port]:-} ]] || die "protocol ports must be different: $effective_port"
+            used_ports[$effective_port]=$protocol
+        fi
+    done
 }
 
 require_supported_system() {
@@ -174,7 +276,7 @@ require_supported_system() {
     esac
 
     [[ ! -e $INSTALL_DIR && ! -e $SERVICE_FILE ]] || {
-        die "singbox-easy is already installed; run 'sbe uninstall' first"
+        die "singbox-easy is already installed; run 'sb' to manage it"
     }
 }
 
@@ -266,13 +368,39 @@ main() {
     install_service
 
     if ((create_default_profile)); then
-        local add_args=(add "$profile_protocol" "$profile_name")
-        [[ -z $profile_port ]] || add_args+=(--port "$profile_port")
-        [[ -z $profile_address ]] || add_args+=(--address "$profile_address")
-        [[ -z $profile_sni ]] || add_args+=(--sni "$profile_sni")
-        [[ -z $hy2_port_range ]] || add_args+=(--port-range "$hy2_port_range")
-        log "creating the initial ${profile_protocol} profile"
-        "$MANAGER_BIN" "${add_args[@]}"
+        local protocol initial_name selected_port suffix
+        local -a add_args created_names=()
+        for protocol in "${profile_protocol_list[@]}"; do
+            initial_name=$profile_name
+            if ((${#profile_protocol_list[@]} > 1)); then
+                case "$protocol" in
+                reality) suffix='vless' ;;
+                hysteria2) suffix='hy2' ;;
+                shadowsocks) suffix='ss' ;;
+                esac
+                initial_name="${profile_name}-${suffix}"
+            fi
+
+            selected_port=$profile_port
+            case "$protocol" in
+            reality) [[ -z $reality_port ]] || selected_port=$reality_port ;;
+            hysteria2) [[ -z $hy2_port ]] || selected_port=$hy2_port ;;
+            shadowsocks) [[ -z $shadowsocks_port ]] || selected_port=$shadowsocks_port ;;
+            esac
+
+            add_args=(add "$protocol" "$initial_name")
+            [[ -z $selected_port ]] || add_args+=(--port "$selected_port")
+            [[ -z $profile_address ]] || add_args+=(--address "$profile_address")
+            if [[ $protocol == reality && -n $profile_sni ]]; then
+                add_args+=(--sni "$profile_sni")
+            fi
+            if [[ $protocol == hysteria2 && -n $hy2_port_range ]]; then
+                add_args+=(--port-range "$hy2_port_range")
+            fi
+            log "creating the initial ${protocol} profile"
+            "$MANAGER_BIN" "${add_args[@]}"
+            created_names+=("$initial_name")
+        done
     else
         log "no profile was created; the service remains disabled and stopped"
     fi
@@ -280,9 +408,12 @@ main() {
     log "installation completed"
     "$MANAGER_BIN" status
     if ((create_default_profile)); then
-        "$MANAGER_BIN" show "$profile_name"
+        local created_name
+        for created_name in "${created_names[@]}"; do
+            "$MANAGER_BIN" show "$created_name"
+        done
     else
-        printf 'Run: sbe add reality default\n'
+        printf 'Run sb to open the management menu.\n'
     fi
 }
 

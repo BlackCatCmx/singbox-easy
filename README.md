@@ -22,6 +22,18 @@ curl -fsSL https://raw.githubusercontent.com/BlackCatCmx/singbox-easy/main/insta
 curl -fsSL https://raw.githubusercontent.com/BlackCatCmx/singbox-easy/main/install.sh | sudo bash -s -- --protocol hysteria2 --name mobile --port 8443
 ```
 
+同时安装 VLESS Reality 和 Hysteria2：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/BlackCatCmx/singbox-easy/main/install.sh | sudo bash -s -- --protocols reality,hysteria2 --name home --reality-port 443 --hy2-port 8443 --sni www.microsoft.com
+```
+
+多协议会创建 `home-vless` 和 `home-hy2` 两个配置。需要 Hy2 端口跳跃时，将 `--hy2-port` 设为范围起点并增加跳跃参数：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/BlackCatCmx/singbox-easy/main/install.sh | sudo bash -s -- --protocols reality,hysteria2 --name home --reality-port 443 --hy2-port 20000 --hy2-port-range 20000:30000
+```
+
 启用 Hysteria2 端口跳跃：
 
 ```bash
@@ -40,8 +52,12 @@ curl -fsSL https://raw.githubusercontent.com/BlackCatCmx/singbox-easy/main/insta
 
 ```text
 --protocol VALUE         reality、hysteria2 或 shadowsocks，默认 reality
---name NAME              初始配置名称，默认 default
---port PORT              监听端口，默认随机空闲端口
+--protocols LIST         多协议，例如 reality,hysteria2
+--name NAME              配置名称；多协议时作为名称前缀，默认 default
+--port PORT              单协议监听端口，默认随机空闲端口
+--reality-port PORT      多协议安装时的 Reality 端口
+--hy2-port PORT          多协议安装时的 Hysteria2 端口
+--ss-port PORT           多协议安装时的 Shadowsocks 端口
 --address ADDRESS        分享链接中的公网 IP 或域名，默认自动检测
 --sni DOMAIN             Reality SNI，默认 www.cloudflare.com
 --hy2-port-range RANGE   Hysteria2 UDP 跳跃范围，例如 20000:30000
@@ -54,27 +70,10 @@ curl -fsSL https://raw.githubusercontent.com/BlackCatCmx/singbox-easy/main/insta
 
 ## 管理命令
 
+安装完成后运行 `sb`，通过中文菜单查看节点、新增或修改配置、管理服务、更新和卸载：
+
 ```bash
-sbe add reality home --port 443 --sni www.microsoft.com
-sbe add hysteria2 mobile --port 8443
-sbe add hysteria2 mobile --port-range 20000:30000
-sbe add shadowsocks backup --port 8388
-
-sbe list
-sbe show home
-sbe set home port 8443
-sbe set home sni www.microsoft.com
-sbe set home address proxy.example.com
-sbe remove home
-
-sbe check
-sbe status
-sbe start
-sbe stop
-sbe restart
-sbe logs
-sbe update
-sbe uninstall
+sb
 ```
 
-修改已启用跳跃的 Hy2 监听端口会同时关闭端口跳跃。删除最后一个配置后服务自动停止，再次添加配置时自动启动。
+无需记忆其他命令。需要自动化时可运行 `sb --help` 查看参数用法。

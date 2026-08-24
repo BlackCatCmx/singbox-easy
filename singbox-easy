@@ -11,7 +11,7 @@ readonly STATE_DIR="${INSTALL_DIR}/state"
 readonly TLS_DIR="${INSTALL_DIR}/tls"
 readonly SERVICE_NAME="singbox-easy.service"
 readonly SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
-readonly MANAGER_BIN="/usr/local/bin/sbe"
+readonly MANAGER_BIN="/usr/local/bin/sb"
 
 log() {
     printf '[singbox-easy] %s\n' "$*"
@@ -24,36 +24,27 @@ die() {
 
 usage() {
     cat <<'EOF'
-singbox-easy - minimal sing-box server manager
+singbox-easy 管理器
 
-Usage:
-  sbe add <reality|hysteria2|shadowsocks> [NAME] [options]
-  sbe list
-  sbe show <NAME>
-  sbe set <NAME> <port|address|sni> <VALUE>
-  sbe remove <NAME>
-  sbe check
-  sbe status
-  sbe start|stop|restart
-  sbe logs
-  sbe update [--no-restart]
-  sbe uninstall
-  sbe version
+用法：
+  sb                              打开交互式管理菜单
+  sb nodes                        输出全部节点链接
+  sb add <协议> [名称] [参数]     新增配置
+  sb list                         查看配置列表
+  sb show <名称>                  查看配置
+  sb set <名称> <字段> <值>       修改配置
+  sb remove <名称>                删除配置
+  sb status|start|stop|restart    管理服务
+  sb update                       更新 sing-box
+  sb uninstall                    卸载
 
-Add options:
-  --port PORT        Use a specific listen port.
-  --address ADDRESS  Public IPv4, IPv6, or domain used in the share URL.
-  --sni DOMAIN       Reality handshake server (default: www.cloudflare.com).
-  --port-range RANGE Hysteria2 UDP hopping range, e.g. 20000:30000.
-                     The range start is the listen/fallback port.
+新增参数：
+  --port PORT          指定监听端口
+  --address ADDRESS    指定公网地址或域名
+  --sni DOMAIN         指定 Reality SNI
+  --port-range RANGE   指定 Hy2 UDP 跳跃范围，例如 20000:30000
 
-Examples:
-  sbe add reality home
-  sbe add hysteria2 mobile --port 443
-  sbe add hysteria2 mobile --port-range 20000:30000
-  sbe add shadowsocks backup --address proxy.example.com
-  sbe set home sni www.microsoft.com
-  sbe set mobile port 8443
+协议：reality、hysteria2、shadowsocks
 EOF
 }
 
@@ -432,7 +423,7 @@ has_profiles() {
 }
 
 add_profile() {
-    (($# >= 1)) || die "usage: sbe add <protocol> [NAME] [options]"
+    (($# >= 1)) || die "usage: sb add <protocol> [NAME] [options]"
     local protocol name='' port='' address='' sni='' port_range=''
     local conf_file state_file tmp_conf tmp_state
     protocol=$(normalize_protocol "$1")
@@ -553,8 +544,18 @@ list_profiles() {
     ((found)) || printf '(no profiles)\n'
 }
 
+show_nodes() {
+    local found=0 state_file
+    for state_file in "$STATE_DIR"/*.json; do
+        [[ -f $state_file ]] || continue
+        found=1
+        jq -r '"\(.name):\n\(.url)\n"' "$state_file"
+    done
+    ((found)) || printf '尚未创建配置。\n'
+}
+
 show_profile() {
-    (($# == 1)) || die "usage: sbe show <NAME>"
+    (($# == 1)) || die "usage: sb show <NAME>"
     validate_name "$1"
     local state_file="${STATE_DIR}/$1.json"
     [[ -f $state_file ]] || die "profile not found: $1"
@@ -574,7 +575,7 @@ show_profile() {
 }
 
 set_profile() {
-    (($# == 3)) || die "usage: sbe set <NAME> <port|address|sni> <VALUE>"
+    (($# == 3)) || die "usage: sb set <NAME> <port|address|sni> <VALUE>"
     local name=$1 field=${2,,} value=$3
     local conf_file state_file tmp_conf tmp_state protocol old_port restart=0 hopping_disabled=0
     validate_name "$name"
@@ -642,7 +643,7 @@ set_profile() {
 }
 
 remove_profile() {
-    (($# == 1)) || die "usage: sbe remove <NAME>"
+    (($# == 1)) || die "usage: sb remove <NAME>"
     validate_name "$1"
     local conf_file="${CONF_DIR}/$1.json" state_file="${STATE_DIR}/$1.json"
     [[ -f $conf_file && -f $state_file ]] || die "profile not found: $1"
@@ -670,7 +671,7 @@ detect_arch() {
 update_core() {
     local no_restart=0 was_active=0
     if (($#)); then
-        [[ $1 == --no-restart && $# == 1 ]] || die "usage: sbe update [--no-restart]"
+        [[ $1 == --no-restart && $# == 1 ]] || die "usage: sb update [--no-restart]"
         no_restart=1
     fi
     if ((no_restart == 0)) && systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
@@ -745,11 +746,126 @@ show_version() {
     printf 'singbox-easy manager: 0.1.0\n'
 }
 
+menu_add_profile() {
+    local choice protocol name port address sni port_range
+    local add_args
+    printf '\n选择协议：\n1) VLESS Reality\n2) Hysteria2\n3) Shadowsocks 2022\n请选择：'
+    read -r choice || return
+    case "$choice" in
+    1) protocol='reality' ;;
+    2) protocol='hysteria2' ;;
+    3) protocol='shadowsocks' ;;
+    *) printf '无效选择。\n' >&2; return ;;
+    esac
+
+    printf '配置名称（留空自动生成）：'
+    read -r name || return
+    printf '监听端口（留空随机）：'
+    read -r port || return
+    printf '公网地址或域名（留空自动检测）：'
+    read -r address || return
+
+    add_args=("$protocol")
+    [[ -z $name ]] || add_args+=("$name")
+    [[ -z $port ]] || add_args+=(--port "$port")
+    [[ -z $address ]] || add_args+=(--address "$address")
+    if [[ $protocol == reality ]]; then
+        printf 'SNI [www.cloudflare.com]：'
+        read -r sni || return
+        [[ -z $sni ]] || add_args+=(--sni "$sni")
+    elif [[ $protocol == hysteria2 ]]; then
+        printf 'UDP 跳跃范围（例如 20000:30000，留空关闭）：'
+        read -r port_range || return
+        [[ -z $port_range ]] || add_args+=(--port-range "$port_range")
+    fi
+    add_profile "${add_args[@]}"
+}
+
+menu_set_profile() {
+    local name choice field value
+    list_profiles
+    printf '要修改的配置名称：'
+    read -r name || return
+    printf '修改项目：\n1) 端口\n2) 公网地址或域名\n3) Reality SNI\n请选择：'
+    read -r choice || return
+    case "$choice" in
+    1) field='port' ;;
+    2) field='address' ;;
+    3) field='sni' ;;
+    *) printf '无效选择。\n' >&2; return ;;
+    esac
+    printf '新值：'
+    read -r value || return
+    set_profile "$name" "$field" "$value"
+}
+
+menu_remove_profile() {
+    local name confirm
+    list_profiles
+    printf '要删除的配置名称：'
+    read -r name || return
+    printf '确认删除 %s？[y/N]：' "$name"
+    read -r confirm || return
+    [[ $confirm == y || $confirm == Y ]] || return
+    remove_profile "$name"
+}
+
+service_menu() {
+    local choice
+    while :; do
+        printf '\n服务管理\n1) 查看状态\n2) 启动\n3) 停止\n4) 重启\n5) 查看最近日志\n0) 返回\n请选择：'
+        read -r choice || return
+        case "$choice" in
+        1) show_status ;;
+        2) has_profiles || { printf '尚未创建配置。\n' >&2; continue; }; systemctl start "$SERVICE_NAME" ;;
+        3) systemctl stop "$SERVICE_NAME" ;;
+        4) has_profiles || { printf '尚未创建配置。\n' >&2; continue; }; systemctl restart "$SERVICE_NAME" ;;
+        5) journalctl -u "$SERVICE_NAME" -n 50 --no-pager ;;
+        0) return ;;
+        *) printf '无效选择。\n' >&2 ;;
+        esac
+    done
+}
+
+show_menu() {
+    local choice confirm
+    while :; do
+        printf '\nsingbox-easy 管理\n1) 查看节点链接\n2) 查看配置列表\n3) 新增配置\n4) 修改配置\n5) 删除配置\n6) 服务管理\n7) 更新 sing-box\n8) 卸载\n0) 退出\n请选择 [1]：'
+        read -r choice || return
+        choice=${choice:-1}
+        case "$choice" in
+        1) show_nodes ;;
+        2) list_profiles ;;
+        3) menu_add_profile ;;
+        4) menu_set_profile ;;
+        5) menu_remove_profile ;;
+        6) service_menu ;;
+        7) update_core ;;
+        8)
+            printf '卸载会删除全部配置，确认继续？[y/N]：'
+            read -r confirm || return
+            if [[ $confirm == y || $confirm == Y ]]; then
+                uninstall_all
+                return
+            fi
+            ;;
+        0) return ;;
+        *) printf '无效选择。\n' >&2 ;;
+        esac
+    done
+}
+
 main() {
-    (($#)) || {
-        usage
+    if (($# == 0)); then
+        require_root
+        require_installation
+        if [[ -t 0 ]]; then
+            show_menu
+        else
+            show_nodes
+        fi
         exit 0
-    }
+    fi
 
     case "$1" in
     -h | --help | help)
@@ -778,6 +894,8 @@ main() {
         require_root
         require_installation
         case "$1" in
+        menu) show_menu ;;
+        nodes) show_nodes ;;
         add) shift; add_profile "$@" ;;
         list | ls) list_profiles ;;
         show) shift; show_profile "$@" ;;
