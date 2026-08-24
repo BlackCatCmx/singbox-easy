@@ -44,10 +44,13 @@ Add options:
   --port PORT        Use a specific listen port.
   --address ADDRESS  Public IPv4, IPv6, or domain used in the share URL.
   --sni DOMAIN       Reality handshake server (default: www.cloudflare.com).
+  --port-range RANGE Hysteria2 UDP hopping range, e.g. 20000:30000.
+                     The range start is the listen/fallback port.
 
 Examples:
   sbe add reality home
   sbe add hysteria2 mobile --port 443
+  sbe add hysteria2 mobile --port-range 20000:30000
   sbe add shadowsocks backup --address proxy.example.com
   sbe set home sni www.microsoft.com
   sbe set mobile port 8443
@@ -66,7 +69,7 @@ require_installation() {
 
 normalize_protocol() {
     case "${1,,}" in
-    reality | vless-reality | vless_reality) printf 'reality\n' ;;
+    reality | vless | vless-reality | vless_reality) printf 'reality\n' ;;
     hysteria2 | hysteria | hy2) printf 'hysteria2\n' ;;
     shadowsocks | shadow | ss | ss2022) printf 'shadowsocks\n' ;;
     *) die "unsupported protocol: $1" ;;
@@ -83,6 +86,17 @@ validate_port() {
     [[ $1 =~ ^[0-9]+$ ]] && ((1 <= 10#$1 && 10#$1 <= 65535)) || {
         die "port must be between 1 and 65535"
     }
+}
+
+normalize_port_range() {
+    local range=${1/-/:} start end
+    [[ $range =~ ^([0-9]+):([0-9]+)$ ]] || die "port range must use START:END"
+    start=${BASH_REMATCH[1]}
+    end=${BASH_REMATCH[2]}
+    validate_port "$start"
+    validate_port "$end"
+    ((10#$start < 10#$end)) || die "port range must be ascending"
+    printf '%s:%s\n' "$((10#$start))" "$((10#$end))"
 }
 
 port_in_use() {
@@ -201,7 +215,7 @@ write_reality_profile() {
 }
 
 write_hysteria2_profile() {
-    local name=$1 port=$2 address=$3 conf_file=$4 state_file=$5
+    local name=$1 port=$2 address=$3 port_range=$4 conf_file=$5 state_file=$6
     local password details
     ensure_tls_certificate
     password=$($CORE_BIN generate rand 32 --base64)
@@ -228,7 +242,13 @@ write_hysteria2_profile() {
           }]
         }' >"$conf_file"
 
-    details=$(jq -nc --arg password "$password" '{password: $password}')
+    if [[ -n $port_range ]]; then
+        details=$(jq -nc --arg password "$password" --arg port_range "$port_range" \
+            '{password: $password, port_range: $port_range, hop_active: true}')
+    else
+        details=$(jq -nc --arg password "$password" \
+            '{password: $password, port_range: "", hop_active: false}')
+    fi
     write_state "$state_file" "$name" hysteria2 "$address" "$port" "$details"
 }
 
@@ -290,10 +310,16 @@ refresh_state_url() {
         url="vless://${uuid}@${host}:${port}?encryption=none&security=reality&flow=xtls-rprx-vision&type=tcp&sni=${sni}&pbk=${encoded_pbk}&fp=chrome#${name}"
         ;;
     hysteria2)
-        local password encoded_password
+        local password encoded_password port_range hop_active client_port
         password=$(jq -er '.password' "$state_file")
         encoded_password=$(url_encode "$password")
-        url="hysteria2://${encoded_password}@${host}:${port}?insecure=1#${name}"
+        port_range=$(jq -r '.port_range // ""' "$state_file")
+        hop_active=$(jq -r '.hop_active // false' "$state_file")
+        client_port=$port
+        if [[ $hop_active == true && -n $port_range ]]; then
+            client_port=${port_range/:/-}
+        fi
+        url="hysteria2://${encoded_password}@${host}:${client_port}?insecure=1#${name}"
         ;;
     shadowsocks)
         local method password userinfo
@@ -308,6 +334,95 @@ refresh_state_url() {
     mv "${state_file}.url" "$state_file"
 }
 
+firewall_profile_values() {
+    local state_file=$1 protocol port port_range start end redirect_range
+    protocol=$(jq -r '.protocol' "$state_file")
+    port_range=$(jq -r '.port_range // ""' "$state_file")
+    [[ $protocol == hysteria2 && -n $port_range ]] || return 1
+    port=$(jq -er '.port' "$state_file")
+    start=${port_range%%:*}
+    end=${port_range##*:}
+    [[ $port == "$start" ]] || return 1
+    if ((10#$start + 1 == 10#$end)); then
+        redirect_range=$end
+    else
+        redirect_range="$((10#$start + 1)):$end"
+    fi
+    printf '%s\t%s\n' "$port" "$redirect_range"
+}
+
+firewall_add_profile() {
+    local state_file=$1 values port redirect_range
+    values=$(firewall_profile_values "$state_file") || return 0
+    IFS=$'\t' read -r port redirect_range <<<"$values"
+    command -v iptables >/dev/null || return 1
+
+    if ! iptables -w 5 -t nat -C PREROUTING -p udp --dport "$redirect_range" \
+        -j REDIRECT --to-ports "$port" 2>/dev/null; then
+        iptables -w 5 -t nat -A PREROUTING -p udp --dport "$redirect_range" \
+            -j REDIRECT --to-ports "$port" || return 1
+    fi
+
+    if command -v ip6tables >/dev/null; then
+        ip6tables -w 5 -t nat -C PREROUTING -p udp --dport "$redirect_range" \
+            -j REDIRECT --to-ports "$port" 2>/dev/null ||
+            ip6tables -w 5 -t nat -A PREROUTING -p udp --dport "$redirect_range" \
+                -j REDIRECT --to-ports "$port" 2>/dev/null ||
+            log "IPv6 hopping rule could not be installed; IPv4 remains active"
+    fi
+}
+
+firewall_remove_profile() {
+    local state_file=$1 values port redirect_range
+    values=$(firewall_profile_values "$state_file") || return 0
+    IFS=$'\t' read -r port redirect_range <<<"$values"
+
+    if command -v iptables >/dev/null; then
+        while iptables -w 5 -t nat -C PREROUTING -p udp --dport "$redirect_range" \
+            -j REDIRECT --to-ports "$port" 2>/dev/null; do
+            iptables -w 5 -t nat -D PREROUTING -p udp --dport "$redirect_range" \
+                -j REDIRECT --to-ports "$port"
+        done
+    fi
+    if command -v ip6tables >/dev/null; then
+        while ip6tables -w 5 -t nat -C PREROUTING -p udp --dport "$redirect_range" \
+            -j REDIRECT --to-ports "$port" 2>/dev/null; do
+            ip6tables -w 5 -t nat -D PREROUTING -p udp --dport "$redirect_range" \
+                -j REDIRECT --to-ports "$port"
+        done
+    fi
+}
+
+disable_profile_hopping() {
+    local state_file=$1 tmp_state="${1}.firewall"
+    jq '.hop_active = false' "$state_file" >"$tmp_state"
+    chmod 0600 "$tmp_state"
+    mv "$tmp_state" "$state_file"
+    refresh_state_url "$state_file"
+}
+
+firewall_add_all() {
+    local state_file hop_active
+    for state_file in "$STATE_DIR"/*.json; do
+        [[ -f $state_file ]] || continue
+        hop_active=$(jq -r '.hop_active // false' "$state_file")
+        [[ $hop_active == true ]] || continue
+        if ! firewall_add_profile "$state_file"; then
+            log "Hysteria2 port hopping failed for $(jq -r '.name' "$state_file"); falling back to port $(jq -r '.port' "$state_file")"
+            firewall_remove_profile "$state_file"
+            disable_profile_hopping "$state_file"
+        fi
+    done
+}
+
+firewall_remove_all() {
+    local state_file
+    for state_file in "$STATE_DIR"/*.json; do
+        [[ -f $state_file ]] || continue
+        firewall_remove_profile "$state_file"
+    done
+}
+
 check_config() {
     "$CORE_BIN" check -c "$CONFIG_FILE" -C "$CONF_DIR"
 }
@@ -318,7 +433,7 @@ has_profiles() {
 
 add_profile() {
     (($# >= 1)) || die "usage: sbe add <protocol> [NAME] [options]"
-    local protocol name='' port='' address='' sni='www.cloudflare.com'
+    local protocol name='' port='' address='' sni='' port_range=''
     local conf_file state_file tmp_conf tmp_state
     protocol=$(normalize_protocol "$1")
     shift
@@ -345,12 +460,31 @@ add_profile() {
             sni=$2
             shift 2
             ;;
+        --port-range | --hy2-port-range)
+            (($# >= 2)) || die "$1 requires a value"
+            port_range=$2
+            shift 2
+            ;;
         *) die "unknown add option: $1" ;;
         esac
     done
 
     if [[ -n $port ]]; then
         validate_port "$port"
+        port=$((10#$port))
+    fi
+
+    if [[ -n $port_range ]]; then
+        [[ $protocol == hysteria2 ]] || die "port hopping is only supported by Hysteria2"
+        port_range=$(normalize_port_range "$port_range")
+        local range_start=${port_range%%:*}
+        [[ -z $port || $port == "$range_start" ]] || {
+            die "Hysteria2 port must equal the hopping range start: $range_start"
+        }
+        port=$range_start
+    fi
+
+    if [[ -n $port ]]; then
         port_in_use "$port" && die "port is already in use: $port"
     else
         port=$(random_port)
@@ -360,7 +494,12 @@ add_profile() {
     validate_name "$name"
     [[ -n $address ]] || address=$(public_address)
     validate_address "$address"
-    validate_sni "$sni"
+    if [[ $protocol == reality ]]; then
+        sni=${sni:-www.cloudflare.com}
+        validate_sni "$sni"
+    elif [[ -n $sni ]]; then
+        die "--sni is only supported by Reality profiles"
+    fi
 
     conf_file="${CONF_DIR}/${name}.json"
     state_file="${STATE_DIR}/${name}.json"
@@ -372,7 +511,7 @@ add_profile() {
 
     case "$protocol" in
     reality) write_reality_profile "$name" "$port" "$address" "$sni" "$tmp_conf" "$tmp_state" ;;
-    hysteria2) write_hysteria2_profile "$name" "$port" "$address" "$tmp_conf" "$tmp_state" ;;
+    hysteria2) write_hysteria2_profile "$name" "$port" "$address" "$port_range" "$tmp_conf" "$tmp_state" ;;
     shadowsocks) write_shadowsocks_profile "$name" "$port" "$address" "$tmp_conf" "$tmp_state" ;;
     esac
 
@@ -385,7 +524,16 @@ add_profile() {
     fi
     mv "$tmp_state" "$state_file"
     systemctl enable "$SERVICE_NAME" >/dev/null
-    systemctl restart "$SERVICE_NAME"
+    if ! systemctl restart "$SERVICE_NAME"; then
+        if [[ $protocol == hysteria2 && -n $port_range ]]; then
+            firewall_remove_profile "$state_file"
+            disable_profile_hopping "$state_file"
+            systemctl reset-failed "$SERVICE_NAME" >/dev/null 2>&1 || true
+            systemctl restart "$SERVICE_NAME" || die "service failed with port hopping and fallback port $port"
+        else
+            die "service failed to start"
+        fi
+    fi
     systemctl is-active --quiet "$SERVICE_NAME" || die "service failed to start"
     trap - EXIT
 
@@ -411,12 +559,24 @@ show_profile() {
     local state_file="${STATE_DIR}/$1.json"
     [[ -f $state_file ]] || die "profile not found: $1"
     jq -r '"Name:     \(.name)\nProtocol: \(.protocol)\nAddress:  \(.address)\nPort:     \(.port)\nURL:      \(.url)"' "$state_file"
+    if [[ $(jq -r '.protocol' "$state_file") == hysteria2 ]]; then
+        local port_range hop_active
+        port_range=$(jq -r '.port_range // ""' "$state_file")
+        hop_active=$(jq -r '.hop_active // false' "$state_file")
+        if [[ -n $port_range ]]; then
+            if [[ $hop_active == true ]]; then
+                printf 'Hopping:  %s (active)\n' "$port_range"
+            else
+                printf 'Hopping:  %s (disabled; using fallback port)\n' "$port_range"
+            fi
+        fi
+    fi
 }
 
 set_profile() {
     (($# == 3)) || die "usage: sbe set <NAME> <port|address|sni> <VALUE>"
     local name=$1 field=${2,,} value=$3
-    local conf_file state_file tmp_conf tmp_state protocol old_port restart=0
+    local conf_file state_file tmp_conf tmp_state protocol old_port restart=0 hopping_disabled=0
     validate_name "$name"
     conf_file="${CONF_DIR}/${name}.json"
     state_file="${STATE_DIR}/${name}.json"
@@ -434,7 +594,13 @@ set_profile() {
             port_in_use "$value" && die "port is already in use: $value"
         fi
         jq --argjson port "$value" '.inbounds[0].listen_port = $port' "$conf_file" >"$tmp_conf"
-        jq --argjson port "$value" '.port = $port' "$state_file" >"$tmp_state"
+        if [[ $protocol == hysteria2 && $value != "$old_port" && $(jq -r '.port_range // ""' "$state_file") ]]; then
+            jq --argjson port "$value" '.port = $port | .port_range = "" | .hop_active = false' \
+                "$state_file" >"$tmp_state"
+            hopping_disabled=1
+        else
+            jq --argjson port "$value" '.port = $port' "$state_file" >"$tmp_state"
+        fi
         restart=1
         ;;
     address)
@@ -457,6 +623,9 @@ set_profile() {
     "$CORE_BIN" check -c "$tmp_conf" >/dev/null
     refresh_state_url "$tmp_state"
     chmod 0600 "$tmp_conf" "$tmp_state"
+    if ((hopping_disabled)); then
+        firewall_remove_profile "$state_file"
+    fi
     mv "$tmp_conf" "$conf_file"
     mv "$tmp_state" "$state_file"
     if ((restart)); then
@@ -465,6 +634,9 @@ set_profile() {
     fi
     trap - EXIT
 
+    if ((hopping_disabled)); then
+        log "Hysteria2 port hopping was disabled because its listen port changed"
+    fi
     log "profile updated: ${name} (${field})"
     show_profile "$name"
 }
@@ -475,6 +647,7 @@ remove_profile() {
     local conf_file="${CONF_DIR}/$1.json" state_file="${STATE_DIR}/$1.json"
     [[ -f $conf_file && -f $state_file ]] || die "profile not found: $1"
 
+    firewall_remove_profile "$state_file"
     rm -f "$conf_file" "$state_file"
     check_config >/dev/null
     if has_profiles; then
@@ -552,6 +725,9 @@ update_core() {
 
 uninstall_all() {
     systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
+    if [[ -d $STATE_DIR ]]; then
+        firewall_remove_all
+    fi
     rm -f "$SERVICE_FILE"
     systemctl daemon-reload
     systemctl reset-failed "$SERVICE_NAME" >/dev/null 2>&1 || true
@@ -587,6 +763,16 @@ main() {
         require_root
         shift
         update_core "$@"
+        ;;
+    firewall-add)
+        require_root
+        require_installation
+        firewall_add_all
+        ;;
+    firewall-remove)
+        require_root
+        require_installation
+        firewall_remove_all
         ;;
     *)
         require_root
