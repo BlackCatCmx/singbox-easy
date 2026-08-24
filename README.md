@@ -13,7 +13,7 @@ curl -fsSL https://raw.githubusercontent.com/BlackCatCmx/singbox-easy/main/insta
 指定 Reality 参数：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/BlackCatCmx/singbox-easy/main/install.sh | sudo bash -s -- --protocol reality --name home --port 443 --sni www.microsoft.com --address proxy.example.com
+curl -fsSL https://raw.githubusercontent.com/BlackCatCmx/singbox-easy/main/install.sh | sudo bash -s -- --protocol reality --name home --port 443 --sni www.cloudflare.com --address proxy.example.com
 ```
 
 安装 Hysteria2：
@@ -25,7 +25,7 @@ curl -fsSL https://raw.githubusercontent.com/BlackCatCmx/singbox-easy/main/insta
 同时安装 VLESS Reality 和 Hysteria2：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/BlackCatCmx/singbox-easy/main/install.sh | sudo bash -s -- --protocols reality,hysteria2 --name home --reality-port 443 --hy2-port 8443 --sni www.microsoft.com
+curl -fsSL https://raw.githubusercontent.com/BlackCatCmx/singbox-easy/main/install.sh | sudo bash -s -- --protocols reality,hysteria2 --name home --reality-port 443 --hy2-port 8443 --sni www.cloudflare.com
 ```
 
 多协议会创建 `home-vless` 和 `home-hy2` 两个配置。需要 Hy2 端口跳跃时，将 `--hy2-port` 设为范围起点并增加跳跃参数：
