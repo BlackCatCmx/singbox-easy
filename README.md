@@ -76,4 +76,20 @@ curl -fsSL https://raw.githubusercontent.com/BlackCatCmx/singbox-easy/main/insta
 sb
 ```
 
+主菜单包含：
+
+```text
+1) 查看节点链接
+2) 查看配置列表
+3) 新增配置
+4) 修改配置
+5) 删除配置
+6) 服务管理
+7) 更新 sing-box
+8) 卸载
+0) 退出
+```
+
+新增配置时可选择 VLESS Reality、Hysteria2 或 Shadowsocks 2022，并设置名称、端口、公网地址、SNI 或 Hy2 跳跃范围。服务管理子菜单包含查看状态、启动、停止、重启和查看最近日志。
+
 无需记忆其他命令。需要自动化时可运行 `sb --help` 查看参数用法。
