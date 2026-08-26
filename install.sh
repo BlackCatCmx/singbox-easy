@@ -16,13 +16,12 @@ profile_protocols_raw=''
 profile_protocol_list=()
 protocol_argument=''
 profile_name='default'
-profile_port=''
 reality_port=''
 hy2_port=''
 shadowsocks_port=''
 profile_address=''
 profile_sni=''
-hy2_port_range=''
+hy2_salamander=0
 profile_option_set=0
 
 log() {
@@ -42,14 +41,12 @@ Options:
   --protocol VALUE         reality, hysteria2, or shadowsocks (default: reality)
   --protocols LIST         Multiple protocols, e.g. reality,hysteria2
   --name NAME              Initial profile name (default: default)
-  --port PORT              Initial profile listen port (default: random free port)
-  --reality-port PORT      Reality port for multi-protocol installation
-  --hy2-port PORT          Hysteria2 port for multi-protocol installation
-  --ss-port PORT           Shadowsocks port for multi-protocol installation
+  --reality-port PORT      Reality listen port (default: random free port)
+  --hy2-port PORT[:END]    Hysteria2 port or UDP hopping range (default: random)
+  --hy2-salamander         Enable Hysteria2 Salamander obfuscation
+  --ss-port PORT           Shadowsocks listen port (default: random free port)
   --address ADDRESS        Public address written to the share URL
   --sni DOMAIN             Reality handshake domain (default: www.cloudflare.com)
-  --hy2-port-range RANGE   Hysteria2 UDP hopping range, e.g. 20000:30000;
-                           the range start is the listen/fallback port
   --ref GIT_REF            Install project files from a branch, tag, or commit
   --no-profile             Install without creating an initial profile
   -h, --help               Show this help
@@ -86,12 +83,6 @@ parse_args() {
             profile_option_set=1
             shift 2
             ;;
-        --port)
-            (($# >= 2)) || die "--port requires a value"
-            profile_port=$2
-            profile_option_set=1
-            shift 2
-            ;;
         --reality-port)
             (($# >= 2)) || die "--reality-port requires a value"
             reality_port=$2
@@ -103,6 +94,11 @@ parse_args() {
             hy2_port=$2
             profile_option_set=1
             shift 2
+            ;;
+        --hy2-salamander)
+            hy2_salamander=1
+            profile_option_set=1
+            shift
             ;;
         --ss-port | --shadowsocks-port)
             (($# >= 2)) || die "$1 requires a value"
@@ -119,12 +115,6 @@ parse_args() {
         --sni)
             (($# >= 2)) || die "--sni requires a value"
             profile_sni=$2
-            profile_option_set=1
-            shift 2
-            ;;
-        --hy2-port-range | --port-range)
-            (($# >= 2)) || die "$1 requires a value"
-            hy2_port_range=$2
             profile_option_set=1
             shift 2
             ;;
@@ -188,19 +178,17 @@ validate_profile_options() {
 
     [[ $profile_name =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]] || die "invalid profile name: $profile_name"
     if ((${#profile_protocol_list[@]} > 1)); then
-        [[ -z $profile_port ]] || die "use protocol-specific ports with --protocols"
         ((${#profile_name} <= 26)) || die "multi-protocol name must not exceed 26 characters"
     fi
     [[ -z $profile_address || $profile_address != *['/?#@']* ]] || die "invalid public address: $profile_address"
 
-    [[ -z $profile_port ]] || profile_port=$(normalize_installer_port "$profile_port")
     [[ -z $reality_port ]] || reality_port=$(normalize_installer_port "$reality_port")
-    [[ -z $hy2_port ]] || hy2_port=$(normalize_installer_port "$hy2_port")
     [[ -z $shadowsocks_port ]] || shadowsocks_port=$(normalize_installer_port "$shadowsocks_port")
 
     local selected=" ${profile_protocol_list[*]} "
     [[ -z $reality_port || $selected == *' reality '* ]] || die "--reality-port requires Reality"
     [[ -z $hy2_port || $selected == *' hysteria2 '* ]] || die "--hy2-port requires Hysteria2"
+    ((hy2_salamander == 0)) || [[ $selected == *' hysteria2 '* ]] || die "--hy2-salamander requires Hysteria2"
     [[ -z $shadowsocks_port || $selected == *' shadowsocks '* ]] || die "--ss-port requires Shadowsocks"
 
     if [[ -n $profile_sni ]]; then
@@ -210,26 +198,16 @@ validate_profile_options() {
         }
     fi
 
-    if [[ -n $hy2_port_range ]]; then
-        [[ $selected == *' hysteria2 '* ]] || die "--hy2-port-range requires Hysteria2"
-        hy2_port_range=${hy2_port_range/-/:}
-        [[ $hy2_port_range =~ ^([0-9]+):([0-9]+)$ ]] || die "port range must use START:END"
+    if [[ $hy2_port == *:* || $hy2_port == *-* ]]; then
+        hy2_port=${hy2_port/-/:}
+        [[ $hy2_port =~ ^([0-9]+):([0-9]+)$ ]] || die "Hysteria2 port range must use START:END"
         local range_start=${BASH_REMATCH[1]} range_end=${BASH_REMATCH[2]}
         ((1 <= 10#$range_start && 10#$range_start < 10#$range_end && 10#$range_end <= 65535)) || {
             die "invalid ascending Hysteria2 port range"
         }
-        range_start=$((10#$range_start))
-        range_end=$((10#$range_end))
-        [[ -z $hy2_port || $hy2_port == "$range_start" ]] || {
-            die "--hy2-port must equal the Hysteria2 range start: $range_start"
-        }
-        if ((${#profile_protocol_list[@]} == 1)); then
-            [[ -z $profile_port || $profile_port == "$range_start" ]] || {
-                die "--port must equal the Hysteria2 range start: $range_start"
-            }
-        fi
-        hy2_port=$range_start
-        hy2_port_range="${range_start}:${range_end}"
+        hy2_port="$((10#$range_start)):$((10#$range_end))"
+    elif [[ -n $hy2_port ]]; then
+        hy2_port=$(normalize_installer_port "$hy2_port")
     fi
 
     local effective_port specific_port
@@ -241,13 +219,7 @@ validate_profile_options() {
         hysteria2) specific_port=$hy2_port ;;
         shadowsocks) specific_port=$shadowsocks_port ;;
         esac
-        effective_port=$specific_port
-        if ((${#profile_protocol_list[@]} == 1)) && [[ -n $profile_port ]]; then
-            [[ -z $specific_port || $specific_port == "$profile_port" ]] || {
-                die "--port conflicts with the protocol-specific port"
-            }
-            effective_port=$profile_port
-        fi
+        effective_port=${specific_port%%:*}
         if [[ -n $effective_port ]]; then
             [[ -z ${used_ports[$effective_port]:-} ]] || die "protocol ports must be different: $effective_port"
             used_ports[$effective_port]=$protocol
@@ -381,7 +353,7 @@ main() {
                 initial_name="${profile_name}-${suffix}"
             fi
 
-            selected_port=$profile_port
+            selected_port=''
             case "$protocol" in
             reality) [[ -z $reality_port ]] || selected_port=$reality_port ;;
             hysteria2) [[ -z $hy2_port ]] || selected_port=$hy2_port ;;
@@ -394,8 +366,8 @@ main() {
             if [[ $protocol == reality && -n $profile_sni ]]; then
                 add_args+=(--sni "$profile_sni")
             fi
-            if [[ $protocol == hysteria2 && -n $hy2_port_range ]]; then
-                add_args+=(--port-range "$hy2_port_range")
+            if [[ $protocol == hysteria2 ]] && ((hy2_salamander)); then
+                add_args+=(--salamander)
             fi
             log "creating the initial ${protocol} profile"
             "$MANAGER_BIN" "${add_args[@]}"

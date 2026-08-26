@@ -32,17 +32,17 @@ singbox-easy 管理器
   sb add <协议> [名称] [参数]     新增配置
   sb list                         查看配置列表
   sb show <名称>                  查看配置
-  sb set <名称> <字段> <值>       修改配置
+  sb set <名称> <字段> <值>       修改配置（Hy2 支持 salamander on|off|toggle）
   sb remove <名称>                删除配置
   sb status|start|stop|restart    管理服务
   sb update                       更新 sing-box
   sb uninstall                    卸载
 
 新增参数：
-  --port PORT          指定监听端口
+  --port PORT[:END]    指定监听端口；Hy2 可直接指定 UDP 跳跃范围
   --address ADDRESS    指定公网地址或域名
   --sni DOMAIN         指定 Reality SNI
-  --port-range RANGE   指定 Hy2 UDP 跳跃范围，例如 20000:30000
+  --salamander         为 Hy2 启用 Salamander 混淆
 
 协议：reality、hysteria2、shadowsocks
 EOF
@@ -206,14 +206,18 @@ write_reality_profile() {
 }
 
 write_hysteria2_profile() {
-    local name=$1 port=$2 address=$3 port_range=$4 conf_file=$5 state_file=$6
-    local password details
+    local name=$1 port=$2 address=$3 port_range=$4 salamander=$5 conf_file=$6 state_file=$7
+    local password obfs_password='' details
     ensure_tls_certificate
     password=$($CORE_BIN generate rand 32 --base64)
+    if ((salamander)); then
+        obfs_password=$($CORE_BIN generate rand 32 --base64)
+    fi
 
     jq -n \
         --arg tag "$name" \
         --arg password "$password" \
+        --arg obfs_password "$obfs_password" \
         --arg certificate "${TLS_DIR}/server.crt" \
         --arg key "${TLS_DIR}/server.key" \
         --argjson port "$port" \
@@ -231,14 +235,16 @@ write_hysteria2_profile() {
               key_path: $key
             }
           }]
-        }' >"$conf_file"
+        } | if $obfs_password == "" then . else .inbounds[0].obfs = {
+          type: "salamander", password: $obfs_password
+        } end' >"$conf_file"
 
     if [[ -n $port_range ]]; then
-        details=$(jq -nc --arg password "$password" --arg port_range "$port_range" \
-            '{password: $password, port_range: $port_range, hop_active: true}')
+        details=$(jq -nc --arg password "$password" --arg port_range "$port_range" --arg obfs_password "$obfs_password" \
+            '{password: $password, port_range: $port_range, hop_active: true, obfs_password: $obfs_password}')
     else
-        details=$(jq -nc --arg password "$password" \
-            '{password: $password, port_range: "", hop_active: false}')
+        details=$(jq -nc --arg password "$password" --arg obfs_password "$obfs_password" \
+            '{password: $password, port_range: "", hop_active: false, obfs_password: $obfs_password}')
     fi
     write_state "$state_file" "$name" hysteria2 "$address" "$port" "$details"
 }
@@ -301,7 +307,7 @@ refresh_state_url() {
         url="vless://${uuid}@${host}:${port}?encryption=none&security=reality&flow=xtls-rprx-vision&type=tcp&sni=${sni}&pbk=${encoded_pbk}&fp=chrome#${name}"
         ;;
     hysteria2)
-        local password encoded_password port_range hop_active client_port
+        local password encoded_password port_range hop_active client_port obfs_password
         password=$(jq -er '.password' "$state_file")
         encoded_password=$(url_encode "$password")
         port_range=$(jq -r '.port_range // ""' "$state_file")
@@ -311,6 +317,10 @@ refresh_state_url() {
             client_port=${port_range/:/-}
         fi
         url="hysteria2://${encoded_password}@${host}:${client_port}?insecure=1#${name}"
+        obfs_password=$(jq -r '.obfs_password // ""' "$state_file")
+        if [[ -n $obfs_password ]]; then
+            url="hysteria2://${encoded_password}@${host}:${client_port}?insecure=1&obfs=salamander&obfs-password=$(url_encode "$obfs_password")#${name}"
+        fi
         ;;
     shadowsocks)
         local method password userinfo
@@ -424,7 +434,7 @@ has_profiles() {
 
 add_profile() {
     (($# >= 1)) || die "usage: sb add <protocol> [NAME] [options]"
-    local protocol name='' port='' address='' sni='' port_range=''
+    local protocol name='' port='' address='' sni='' port_range='' salamander=0
     local conf_file state_file tmp_conf tmp_state
     protocol=$(normalize_protocol "$1")
     shift
@@ -451,29 +461,24 @@ add_profile() {
             sni=$2
             shift 2
             ;;
-        --port-range | --hy2-port-range)
-            (($# >= 2)) || die "$1 requires a value"
-            port_range=$2
-            shift 2
+        --salamander)
+            salamander=1
+            shift
             ;;
         *) die "unknown add option: $1" ;;
         esac
     done
 
-    if [[ -n $port ]]; then
+    if [[ $port == *:* || $port == *-* ]]; then
+        [[ $protocol == hysteria2 ]] || die "port hopping is only supported by Hysteria2"
+        port_range=$(normalize_port_range "$port")
+        local range_start=${port_range%%:*}
+        port=$range_start
+    elif [[ -n $port ]]; then
         validate_port "$port"
         port=$((10#$port))
     fi
-
-    if [[ -n $port_range ]]; then
-        [[ $protocol == hysteria2 ]] || die "port hopping is only supported by Hysteria2"
-        port_range=$(normalize_port_range "$port_range")
-        local range_start=${port_range%%:*}
-        [[ -z $port || $port == "$range_start" ]] || {
-            die "Hysteria2 port must equal the hopping range start: $range_start"
-        }
-        port=$range_start
-    fi
+    ((salamander == 0)) || [[ $protocol == hysteria2 ]] || die "Salamander is only supported by Hysteria2"
 
     if [[ -n $port ]]; then
         port_in_use "$port" && die "port is already in use: $port"
@@ -502,7 +507,7 @@ add_profile() {
 
     case "$protocol" in
     reality) write_reality_profile "$name" "$port" "$address" "$sni" "$tmp_conf" "$tmp_state" ;;
-    hysteria2) write_hysteria2_profile "$name" "$port" "$address" "$port_range" "$tmp_conf" "$tmp_state" ;;
+    hysteria2) write_hysteria2_profile "$name" "$port" "$address" "$port_range" "$salamander" "$tmp_conf" "$tmp_state" ;;
     shadowsocks) write_shadowsocks_profile "$name" "$port" "$address" "$tmp_conf" "$tmp_state" ;;
     esac
 
@@ -561,9 +566,10 @@ show_profile() {
     [[ -f $state_file ]] || die "profile not found: $1"
     jq -r '"Name:     \(.name)\nProtocol: \(.protocol)\nAddress:  \(.address)\nPort:     \(.port)\nURL:      \(.url)"' "$state_file"
     if [[ $(jq -r '.protocol' "$state_file") == hysteria2 ]]; then
-        local port_range hop_active
+        local port_range hop_active obfs_password
         port_range=$(jq -r '.port_range // ""' "$state_file")
         hop_active=$(jq -r '.hop_active // false' "$state_file")
+        obfs_password=$(jq -r '.obfs_password // ""' "$state_file")
         if [[ -n $port_range ]]; then
             if [[ $hop_active == true ]]; then
                 printf 'Hopping:  %s (active)\n' "$port_range"
@@ -571,11 +577,16 @@ show_profile() {
                 printf 'Hopping:  %s (disabled; using fallback port)\n' "$port_range"
             fi
         fi
+        if [[ -n $obfs_password ]]; then
+            printf 'Salamander: enabled\n'
+        else
+            printf 'Salamander: disabled\n'
+        fi
     fi
 }
 
 set_profile() {
-    (($# == 3)) || die "usage: sb set <NAME> <port|address|sni> <VALUE>"
+    (($# == 3)) || die "usage: sb set <NAME> <port|address|sni|salamander> <VALUE>"
     local name=$1 field=${2,,} value=$3
     local conf_file state_file tmp_conf tmp_state protocol old_port restart=0 hopping_disabled=0
     validate_name "$name"
@@ -616,6 +627,40 @@ set_profile() {
             '.inbounds[0].tls.server_name = $sni | .inbounds[0].tls.reality.handshake.server = $sni' \
             "$conf_file" >"$tmp_conf"
         jq --arg sni "$value" '.sni = $sni' "$state_file" >"$tmp_state"
+        restart=1
+        ;;
+    salamander)
+        [[ $protocol == hysteria2 ]] || die "Salamander can only be changed for Hysteria2 profiles"
+        local current target obfs_password
+        if [[ -n $(jq -r '.obfs_password // ""' "$state_file") ]]; then
+            current=on
+        else
+            current=off
+        fi
+        case "${value,,}" in
+        toggle)
+            if [[ $current == on ]]; then target=off; else target=on; fi
+            ;;
+        on | off) target=${value,,} ;;
+        *) die "Salamander value must be on, off, or toggle" ;;
+        esac
+        if [[ $current == "$target" ]]; then
+            log "Hysteria2 Salamander is already ${target}"
+            trap - EXIT
+            show_profile "$name"
+            return
+        fi
+        if [[ $target == on ]]; then
+            obfs_password=$($CORE_BIN generate rand 32 --base64)
+            jq --arg password "$obfs_password" \
+                '.inbounds[0].obfs = {type: "salamander", password: $password}' \
+                "$conf_file" >"$tmp_conf"
+            jq --arg password "$obfs_password" '.obfs_password = $password' \
+                "$state_file" >"$tmp_state"
+        else
+            jq 'del(.inbounds[0].obfs)' "$conf_file" >"$tmp_conf"
+            jq '.obfs_password = ""' "$state_file" >"$tmp_state"
+        fi
         restart=1
         ;;
     *) die "unsupported setting: $field" ;;
@@ -747,7 +792,7 @@ show_version() {
 }
 
 menu_add_profile() {
-    local choice protocol name port address sni port_range
+    local choice protocol name port address sni salamander
     local add_args
     printf '\n选择协议：\n1) VLESS Reality\n2) Hysteria2\n3) Shadowsocks 2022\n请选择：'
     read -r choice || return
@@ -760,7 +805,11 @@ menu_add_profile() {
 
     printf '配置名称（留空自动生成）：'
     read -r name || return
-    printf '监听端口（留空随机）：'
+    if [[ $protocol == hysteria2 ]]; then
+        printf '监听端口或 UDP 跳跃范围（例如 8443 或 20000:30000，留空随机）：'
+    else
+        printf '监听端口（留空随机）：'
+    fi
     read -r port || return
     printf '公网地址或域名（留空自动检测）：'
     read -r address || return
@@ -774,9 +823,9 @@ menu_add_profile() {
         read -r sni || return
         [[ -z $sni ]] || add_args+=(--sni "$sni")
     elif [[ $protocol == hysteria2 ]]; then
-        printf 'UDP 跳跃范围（例如 20000:30000，留空关闭）：'
-        read -r port_range || return
-        [[ -z $port_range ]] || add_args+=(--port-range "$port_range")
+        printf '启用 Salamander 混淆？[y/N]：'
+        read -r salamander || return
+        [[ $salamander == y || $salamander == Y ]] && add_args+=(--salamander)
     fi
     add_profile "${add_args[@]}"
 }
@@ -786,15 +835,20 @@ menu_set_profile() {
     list_profiles
     printf '要修改的配置名称：'
     read -r name || return
-    printf '修改项目：\n1) 端口\n2) 公网地址或域名\n3) Reality SNI\n请选择：'
+    printf '修改项目：\n1) 端口\n2) 公网地址或域名\n3) Reality SNI\n4) Hy2 Salamander\n请选择：'
     read -r choice || return
     case "$choice" in
     1) field='port' ;;
     2) field='address' ;;
     3) field='sni' ;;
+    4) field='salamander' ;;
     *) printf '无效选择。\n' >&2; return ;;
     esac
-    printf '新值：'
+    if [[ $field == salamander ]]; then
+        printf '新值（on、off 或 toggle）：'
+    else
+        printf '新值：'
+    fi
     read -r value || return
     set_profile "$name" "$field" "$value"
 }
