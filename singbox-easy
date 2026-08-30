@@ -93,7 +93,7 @@ normalize_port_range() {
 port_in_use() {
     local port=$1
     if command -v ss >/dev/null; then
-        ss -H -lntu | awk '{print $5}' | grep -Eq "(^|:)$port$" && return 0
+        ss -H -lntu | awk '{print $4}' | grep -Eq "(^|:)$port$" && return 0
     fi
     grep -Rqs '"listen_port"[[:space:]]*:[[:space:]]*'"$port"'\([,[:space:]]\|$\)' "$CONF_DIR" && return 0
     return 1
