@@ -93,6 +93,6 @@ sb
 0) 退出
 ```
 
-新增配置时可选择 VLESS Reality、Hysteria2 或 Shadowsocks 2022，并设置名称、端口、公网地址、SNI、Hy2 跳跃范围或 Salamander。已有 Hy2 配置可在修改菜单中切换 Salamander；切换后需要重新导入新的节点链接。服务管理子菜单包含查看状态、启动、停止、重启和查看最近日志。
+新增配置时可选择 VLESS Reality、Hysteria2 或 Shadowsocks 2022，并设置名称、端口、公网地址、SNI、Hy2 跳跃范围或 Salamander。已有 Hy2 配置可在修改菜单中切换单端口或 UDP 跳跃范围，也可切换 Salamander；修改后需要重新导入新的节点链接。服务管理子菜单包含查看状态、启动、停止、重启和查看最近日志。
 
 无需记忆其他命令。需要自动化时可运行 `sb --help` 查看参数用法。

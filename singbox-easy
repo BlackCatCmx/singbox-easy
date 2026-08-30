@@ -32,7 +32,7 @@ singbox-easy 管理器
   sb add <协议> [名称] [参数]     新增配置
   sb list                         查看配置列表
   sb show <名称>                  查看配置
-  sb set <名称> <字段> <值>       修改配置（Hy2 支持 salamander on|off|toggle）
+  sb set <名称> <字段> <值>       修改配置（Hy2 端口支持单端口或跳跃范围）
   sb remove <名称>                删除配置
   sb status|start|stop|restart    管理服务
   sb update                       更新 sing-box
@@ -588,7 +588,8 @@ show_profile() {
 set_profile() {
     (($# == 3)) || die "usage: sb set <NAME> <port|address|sni|salamander> <VALUE>"
     local name=$1 field=${2,,} value=$3
-    local conf_file state_file tmp_conf tmp_state protocol old_port restart=0 hopping_disabled=0
+    local conf_file state_file tmp_conf tmp_state protocol old_port old_port_range=''
+    local restart=0 replace_hopping_rule=0
     validate_name "$name"
     conf_file="${CONF_DIR}/${name}.json"
     state_file="${STATE_DIR}/${name}.json"
@@ -601,15 +602,25 @@ set_profile() {
 
     case "$field" in
     port)
-        validate_port "$value"
+        local port_range=''
+        if [[ $value == *:* || $value == *-* ]]; then
+            [[ $protocol == hysteria2 ]] || die "port hopping is only supported by Hysteria2"
+            port_range=$(normalize_port_range "$value")
+            value=${port_range%%:*}
+        else
+            validate_port "$value"
+            value=$((10#$value))
+        fi
         if [[ $value != "$old_port" ]]; then
             port_in_use "$value" && die "port is already in use: $value"
         fi
         jq --argjson port "$value" '.inbounds[0].listen_port = $port' "$conf_file" >"$tmp_conf"
-        if [[ $protocol == hysteria2 && $value != "$old_port" && $(jq -r '.port_range // ""' "$state_file") ]]; then
-            jq --argjson port "$value" '.port = $port | .port_range = "" | .hop_active = false' \
+        if [[ $protocol == hysteria2 ]]; then
+            old_port_range=$(jq -r '.port_range // ""' "$state_file")
+            jq --argjson port "$value" --arg port_range "$port_range" \
+                '.port = $port | .port_range = $port_range | .hop_active = ($port_range != "")' \
                 "$state_file" >"$tmp_state"
-            hopping_disabled=1
+            [[ -z $old_port_range ]] || replace_hopping_rule=1
         else
             jq --argjson port "$value" '.port = $port' "$state_file" >"$tmp_state"
         fi
@@ -669,7 +680,7 @@ set_profile() {
     "$CORE_BIN" check -c "$tmp_conf" >/dev/null
     refresh_state_url "$tmp_state"
     chmod 0600 "$tmp_conf" "$tmp_state"
-    if ((hopping_disabled)); then
+    if ((replace_hopping_rule)); then
         firewall_remove_profile "$state_file"
     fi
     mv "$tmp_conf" "$conf_file"
@@ -680,9 +691,6 @@ set_profile() {
     fi
     trap - EXIT
 
-    if ((hopping_disabled)); then
-        log "Hysteria2 port hopping was disabled because its listen port changed"
-    fi
     log "profile updated: ${name} (${field})"
     show_profile "$name"
 }
@@ -846,6 +854,8 @@ menu_set_profile() {
     esac
     if [[ $field == salamander ]]; then
         printf '新值（on、off 或 toggle）：'
+    elif [[ $field == port ]]; then
+        printf '新端口（Hy2 可输入 UDP 跳跃范围，例如 8443 或 20000:30000）：'
     else
         printf '新值：'
     fi
