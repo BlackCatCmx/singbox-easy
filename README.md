@@ -54,6 +54,12 @@ curl -fsSL https://raw.githubusercontent.com/BlackCatCmx/singbox-easy/main/insta
 curl -fsSL https://raw.githubusercontent.com/BlackCatCmx/singbox-easy/main/install.sh | sudo bash -s -- --protocol shadowsocks --name backup --ss-port 8388
 ```
 
+安装指定版本的 sing-box；不传此参数时仍安装最新正式版：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/BlackCatCmx/singbox-easy/main/install.sh | sudo bash -s -- --sing-box-version 1.13.19
+```
+
 ## 可用参数
 
 ```text
@@ -66,6 +72,7 @@ curl -fsSL https://raw.githubusercontent.com/BlackCatCmx/singbox-easy/main/insta
 --ss-port PORT           Shadowsocks 监听端口，默认随机空闲端口
 --address ADDRESS        分享链接中的公网 IP 或域名，默认自动检测
 --sni DOMAIN             Reality SNI，默认 www.cloudflare.com
+--sing-box-version VER   指定 sing-box 版本，默认 latest
 --no-profile             只安装程序，不创建初始配置
 --ref GIT_REF            从指定分支、标签或提交安装
 --help                   显示帮助
@@ -96,3 +103,5 @@ sb
 新增配置时可选择 VLESS Reality、Hysteria2 或 Shadowsocks 2022，并设置名称、端口、公网地址、SNI、Hy2 跳跃范围或 Salamander。已有 Hy2 配置可在修改菜单中切换单端口或 UDP 跳跃范围，也可切换 Salamander；修改后需要重新导入新的节点链接。服务管理子菜单包含查看状态、启动、停止、重启和查看最近日志。
 
 无需记忆其他命令。需要自动化时可运行 `sb --help` 查看参数用法。
+
+`sb update` 默认更新到最新正式版；`sb update 1.13.19` 可切换到指定版本。

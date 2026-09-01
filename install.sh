@@ -10,6 +10,7 @@ readonly MANAGER_BIN="/usr/local/bin/sb"
 readonly SERVICE_FILE="/etc/systemd/system/singbox-easy.service"
 
 project_ref="${SINGBOX_EASY_REF:-$PROJECT_REF_DEFAULT}"
+sing_box_version='latest'
 create_default_profile=1
 profile_protocol='reality'
 profile_protocols_raw=''
@@ -47,6 +48,7 @@ Options:
   --ss-port PORT           Shadowsocks listen port (default: random free port)
   --address ADDRESS        Public address written to the share URL
   --sni DOMAIN             Reality handshake domain (default: www.cloudflare.com)
+  --sing-box-version VER   Install a specific sing-box version (default: latest)
   --ref GIT_REF            Install project files from a branch, tag, or commit
   --no-profile             Install without creating an initial profile
   -h, --help               Show this help
@@ -59,6 +61,14 @@ parse_args() {
         --ref)
             (($# >= 2)) || die "--ref requires a value"
             project_ref=$2
+            shift 2
+            ;;
+        --sing-box-version)
+            (($# >= 2)) || die "--sing-box-version requires a value"
+            sing_box_version=${2#v}
+            [[ $sing_box_version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+                die "invalid sing-box version: $2"
+            }
             shift 2
             ;;
         --protocol)
@@ -335,8 +345,13 @@ main() {
     initialize_layout
     install_manager
 
-    log "downloading the latest sing-box release"
-    "$MANAGER_BIN" update --no-restart
+    if [[ $sing_box_version == latest ]]; then
+        log "downloading the latest sing-box release"
+        "$MANAGER_BIN" update --no-restart
+    else
+        log "downloading sing-box v${sing_box_version}"
+        "$MANAGER_BIN" update "$sing_box_version" --no-restart
+    fi
     install_service
 
     if ((create_default_profile)); then

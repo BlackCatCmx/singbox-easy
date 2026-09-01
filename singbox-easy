@@ -35,7 +35,7 @@ singbox-easy 管理器
   sb set <名称> <字段> <值>       修改配置（Hy2 端口支持单端口或跳跃范围）
   sb remove <名称>                删除配置
   sb status|start|stop|restart    管理服务
-  sb update                       更新 sing-box
+  sb update [版本号]              更新 sing-box（默认最新版）
   sb uninstall                    卸载
 
 新增参数：
@@ -722,24 +722,40 @@ detect_arch() {
 }
 
 update_core() {
-    local no_restart=0 was_active=0
-    if (($#)); then
-        [[ $1 == --no-restart && $# == 1 ]] || die "usage: sb update [--no-restart]"
-        no_restart=1
-    fi
+    local no_restart=0 was_active=0 requested_version='latest'
+    while (($#)); do
+        case "$1" in
+        --no-restart)
+            no_restart=1
+            ;;
+        *)
+            [[ $requested_version == latest ]] || die "usage: sb update [VERSION] [--no-restart]"
+            requested_version=${1#v}
+            [[ $requested_version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+                die "invalid sing-box version: $1"
+            }
+            ;;
+        esac
+        shift
+    done
     if ((no_restart == 0)) && systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
         was_active=1
     fi
 
-    local arch release_json version asset_name asset_url expected_digest
+    local arch release_json release_url version asset_name asset_url expected_digest
     local tmp_dir archive extracted extracted_dir actual_digest
     arch=$(detect_arch)
     tmp_dir=$(mktemp -d)
     trap 'rm -rf "${tmp_dir:-}"' EXIT
 
     release_json="${tmp_dir}/release.json"
+    if [[ $requested_version == latest ]]; then
+        release_url='https://api.github.com/repos/SagerNet/sing-box/releases/latest'
+    else
+        release_url="https://api.github.com/repos/SagerNet/sing-box/releases/tags/v${requested_version}"
+    fi
     curl -fL --retry 3 --retry-delay 1 \
-        https://api.github.com/repos/SagerNet/sing-box/releases/latest \
+        "$release_url" \
         -o "$release_json"
     version=$(jq -er '.tag_name' "$release_json")
     asset_name="sing-box-${version#v}-linux-${arch}.tar.gz"
