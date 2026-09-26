@@ -22,6 +22,7 @@ hy2_port=''
 shadowsocks_port=''
 profile_address=''
 profile_sni=''
+reality_handshake_server=''
 hy2_salamander=0
 profile_option_set=0
 
@@ -47,7 +48,8 @@ Options:
   --hy2-salamander         Enable Hysteria2 Salamander obfuscation
   --ss-port PORT           Shadowsocks listen port (default: random free port)
   --address ADDRESS        Public address written to the share URL
-  --sni DOMAIN             Reality handshake domain (default: www.cloudflare.com)
+  --sni DOMAIN             Reality SNI (default: www.cloudflare.com)
+  --reality-handshake-server HOST  Reality handshake target (default: SNI)
   --sing-box-version VER   Install a specific sing-box version (default: 1.13.21)
   --ref GIT_REF            Install project files from a branch, tag, or commit
   --no-profile             Install without creating an initial profile
@@ -128,6 +130,13 @@ parse_args() {
             profile_option_set=1
             shift 2
             ;;
+        --reality-handshake-server)
+            (($# >= 2)) || die "--reality-handshake-server requires a value"
+            [[ -n $2 ]] || die "--reality-handshake-server requires a value"
+            reality_handshake_server=$2
+            profile_option_set=1
+            shift 2
+            ;;
         --no-profile)
             create_default_profile=0
             shift
@@ -205,6 +214,12 @@ validate_profile_options() {
         [[ $selected == *' reality '* ]] || die "--sni requires Reality"
         [[ $profile_sni =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ && $profile_sni == *.* ]] || {
             die "invalid SNI domain: $profile_sni"
+        }
+    fi
+    if [[ -n $reality_handshake_server ]]; then
+        [[ $selected == *' reality '* ]] || die "--reality-handshake-server requires Reality"
+        [[ $reality_handshake_server =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || {
+            die "invalid Reality handshake server: $reality_handshake_server"
         }
     fi
 
@@ -375,6 +390,9 @@ main() {
             [[ -z $profile_address ]] || add_args+=(--address "$profile_address")
             if [[ $protocol == reality && -n $profile_sni ]]; then
                 add_args+=(--sni "$profile_sni")
+            fi
+            if [[ $protocol == reality && -n $reality_handshake_server ]]; then
+                add_args+=(--reality-handshake-server "$reality_handshake_server")
             fi
             if [[ $protocol == hysteria2 ]] && ((hy2_salamander)); then
                 add_args+=(--salamander)

@@ -16,6 +16,12 @@ curl -fsSL https://raw.githubusercontent.com/BlackCatCmx/singbox-easy/main/insta
 curl -fsSL https://raw.githubusercontent.com/BlackCatCmx/singbox-easy/main/install.sh | sudo bash -s -- --protocol reality --name home --reality-port 443 --sni addons.mozilla.org --address proxy.example.com
 ```
 
+当握手目标站点与 Reality 位于同一台服务器时，可单独指定本机握手地址，SNI 仍使用站点域名：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/BlackCatCmx/singbox-easy/main/install.sh | sudo bash -s -- --protocol reality --name home --reality-port 41310 --sni site.example.com --reality-handshake-server 127.0.0.1
+```
+
 安装 Hysteria2：
 
 ```bash
@@ -72,6 +78,7 @@ curl -fsSL https://raw.githubusercontent.com/BlackCatCmx/singbox-easy/main/insta
 --ss-port PORT           Shadowsocks 监听端口，默认随机空闲端口
 --address ADDRESS        分享链接中的公网 IP 或域名，默认自动检测
 --sni DOMAIN             Reality SNI，默认 www.cloudflare.com
+--reality-handshake-server HOST  Reality 握手目标，默认与 SNI 相同
 --sing-box-version VER   指定 sing-box 版本，默认 1.13.21
 --no-profile             只安装程序，不创建初始配置
 --ref GIT_REF            从指定分支、标签或提交安装
@@ -100,7 +107,7 @@ sb
 0) 退出
 ```
 
-新增配置时可选择 VLESS Reality、Hysteria2 或 Shadowsocks 2022，并设置名称、端口、公网地址、SNI、Hy2 跳跃范围或 Salamander。已有 Hy2 配置可在修改菜单中切换单端口或 UDP 跳跃范围，也可切换 Salamander；修改后需要重新导入新的节点链接。服务管理子菜单包含查看状态、启动、停止、重启和查看最近日志。
+新增配置时可选择 VLESS Reality、Hysteria2 或 Shadowsocks 2022，并设置名称、端口、公网地址、SNI、Reality 握手目标、Hy2 跳跃范围或 Salamander。已有 Reality 配置可分别修改 SNI 和握手目标；已有 Hy2 配置可切换单端口、UDP 跳跃范围或 Salamander。修改节点参数后需要重新导入新的节点链接。服务管理子菜单包含查看状态、启动、停止、重启和查看最近日志。
 
 无需记忆其他命令。需要自动化时可运行 `sb --help` 查看参数用法。
 
