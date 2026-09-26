@@ -54,7 +54,7 @@ curl -fsSL https://raw.githubusercontent.com/BlackCatCmx/singbox-easy/main/insta
 curl -fsSL https://raw.githubusercontent.com/BlackCatCmx/singbox-easy/main/install.sh | sudo bash -s -- --protocol shadowsocks --name backup --ss-port 8388
 ```
 
-安装指定版本的 sing-box；不传此参数时仍安装最新正式版：
+安装指定版本的 sing-box；不传此参数时安装 1.13.21：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/BlackCatCmx/singbox-easy/main/install.sh | sudo bash -s -- --sing-box-version 1.13.19
@@ -72,7 +72,7 @@ curl -fsSL https://raw.githubusercontent.com/BlackCatCmx/singbox-easy/main/insta
 --ss-port PORT           Shadowsocks 监听端口，默认随机空闲端口
 --address ADDRESS        分享链接中的公网 IP 或域名，默认自动检测
 --sni DOMAIN             Reality SNI，默认 www.cloudflare.com
---sing-box-version VER   指定 sing-box 版本，默认 latest
+--sing-box-version VER   指定 sing-box 版本，默认 1.13.21
 --no-profile             只安装程序，不创建初始配置
 --ref GIT_REF            从指定分支、标签或提交安装
 --help                   显示帮助
